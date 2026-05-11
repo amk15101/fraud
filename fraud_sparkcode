@@ -1,0 +1,1236 @@
+from pyspark.sql import SparkSession, DataFrame
+import pyspark.sql.functions as F
+from pyspark.sql.types import *
+from itertools import combinations
+import pandas as pd
+import numpy as np
+from typing import List, Tuple, Dict, Optional
+
+# =============================================================================
+# FUNCTION 1: CATEGORICAL RULE GENERATION
+# =============================================================================
+
+def generate_fraud_rules(
+    sp_df: DataFrame,
+    target_flag: str = "fraud_trans",
+    target_amt: str = "fraud_amt",
+    min_hit_rate: float = 0.10,
+    max_cardinality: int = 50,
+    min_support: int = 100,
+    max_combination_depth: int = 3,
+    exclude_patterns: Optional[List[str]] = None
+):
+    if exclude_patterns is None:
+        exclude_patterns = [
+            'id', 'ID', 'Id', '_id', '_ID',
+            'date', 'Date', 'DATE', '_dt', '_DT',
+            'time', 'Time', 'TIME', 'timestamp', 'Timestamp',
+            'key', 'Key', 'KEY',
+            'name', 'Name', 'NAME',
+            'address', 'Address',
+            'phone', 'Phone',
+            'email', 'Email',
+            'ssn', 'SSN',
+            'account_number', 'acct_no', 'acct_num',
+            'card_number', 'card_no', 'card_num',
+            'ip_address', 'ip_addr',
+            'uuid', 'UUID'
+        ]
+    
+    print("=" * 80)
+    print("FRAUD RULE GENERATION ENGINE")
+    print("=" * 80)
+    
+    print("\n[STEP 1] Filtering columns...")
+    all_columns = sp_df.columns
+    candidate_columns = [c for c in all_columns if c not in [target_flag, target_amt]]
+    
+    def should_exclude(col_name: str) -> bool:
+        for pattern in exclude_patterns:
+            if pattern.lower() in col_name.lower():
+                return True
+        return False
+    
+    candidate_columns = [c for c in candidate_columns if not should_exclude(c)]
+    print(f"  Columns after pattern exclusion: {len(candidate_columns)}")
+    
+    print("\n[STEP 2] Checking cardinality...")
+    sp_df.cache()
+    total_count = sp_df.count()
+    total_fraud = sp_df.filter(F.col(target_flag) == 1).count()
+    overall_fraud_rate = total_fraud / total_count if total_count > 0 else 0
+    
+    print(f"  Total records: {total_count:,}")
+    print(f"  Total frauds: {total_fraud:,}")
+    print(f"  Overall fraud rate: {overall_fraud_rate:.4%}")
+    
+    valid_columns = []
+    column_types = {}
+    
+    for col in candidate_columns:
+        dtype = dict(sp_df.dtypes).get(col, "")
+        distinct_count = sp_df.select(col).distinct().count()
+        
+        if distinct_count <= max_cardinality:
+            valid_columns.append(col)
+            column_types[col] = {
+                'dtype': dtype,
+                'distinct_count': distinct_count
+            }
+        else:
+            if dtype in ('int', 'bigint', 'float', 'double', 'decimal'):
+                valid_columns.append(col)
+                column_types[col] = {
+                    'dtype': dtype,
+                    'distinct_count': distinct_count,
+                    'needs_binning': True
+                }
+    
+    print(f"  Valid columns for rule generation: {len(valid_columns)}")
+    print(f"  Columns: {valid_columns}")
+    
+    print("\n[STEP 3] Binning high-cardinality numeric columns...")
+    binned_df = sp_df
+    binned_columns = []
+    
+    for col in valid_columns[:]:
+        if column_types.get(col, {}).get('needs_binning', False):
+            bin_col_name = f"{col}_bin"
+            percentiles = binned_df.approxQuantile(col, [0.0, 0.2, 0.4, 0.6, 0.8, 1.0], 0.01)
+            
+            if len(set(percentiles)) > 1:
+                when_expr = None
+                for i in range(len(percentiles) - 1):
+                    label = f"{col}_Q{i+1}({percentiles[i]:.2f}-{percentiles[i+1]:.2f})"
+                    if when_expr is None:
+                        when_expr = F.when(
+                            (F.col(col) >= percentiles[i]) & (F.col(col) <= percentiles[i+1]),
+                            F.lit(label)
+                        )
+                    else:
+                        when_expr = when_expr.when(
+                            (F.col(col) > percentiles[i]) & (F.col(col) <= percentiles[i+1]),
+                            F.lit(label)
+                        )
+                
+                when_expr = when_expr.otherwise(F.lit(f"{col}_OTHER"))
+                binned_df = binned_df.withColumn(bin_col_name, when_expr)
+                binned_columns.append(bin_col_name)
+                valid_columns = [bin_col_name if c == col else c for c in valid_columns]
+            else:
+                valid_columns.remove(col)
+    
+    print(f"  Binned columns created: {len(binned_columns)}")
+    
+    working_df = binned_df
+    working_df.cache()
+    
+    print("\n[STEP 4] Generating single-variable rules...")
+    all_rules = []
+    
+    for col in valid_columns:
+        try:
+            rule_stats = working_df.groupBy(col).agg(
+                F.count("*").alias("total_count"),
+                F.sum(F.col(target_flag).cast("int")).alias("fraud_count"),
+                F.sum(
+                    F.when(F.col(target_flag) == 1, F.col(target_amt)).otherwise(0)
+                ).alias("fraud_amount_sum"),
+                F.avg(
+                    F.when(F.col(target_flag) == 1, F.col(target_amt)).otherwise(None)
+                ).alias("avg_fraud_amount")
+            ).collect()
+            
+            for row in rule_stats:
+                value = row[col]
+                count = row['total_count']
+                fraud_count = row['fraud_count'] or 0
+                fraud_amount = row['fraud_amount_sum'] or 0
+                avg_fraud_amt = row['avg_fraud_amount'] or 0
+                
+                if count >= min_support and count > 0:
+                    hit_rate = fraud_count / count
+                    if hit_rate >= min_hit_rate:
+                        rule = {
+                            'rule_description': f"{col} = '{value}'",
+                            'rule_columns': col,
+                            'rule_values': str(value),
+                            'combination_depth': 1,
+                            'total_records': count,
+                            'fraud_count': fraud_count,
+                            'hit_rate': hit_rate,
+                            'fraud_amount_sum': fraud_amount,
+                            'avg_fraud_amount': avg_fraud_amt,
+                            'lift': hit_rate / overall_fraud_rate if overall_fraud_rate > 0 else 0,
+                            'fraud_capture_rate': fraud_count / total_fraud if total_fraud > 0 else 0
+                        }
+                        all_rules.append(rule)
+        except Exception as e:
+            print(f"  Warning: Error processing column {col}: {str(e)}")
+            continue
+    
+    print(f"  Single-variable rules found: {len(all_rules)}")
+    
+    if max_combination_depth >= 2:
+        print("\n[STEP 5] Generating two-variable combination rules...")
+        two_var_rules = []
+        col_combinations_2 = list(combinations(valid_columns, 2))
+        print(f"  Total 2-variable combinations to test: {len(col_combinations_2)}")
+        
+        for idx, (col1, col2) in enumerate(col_combinations_2):
+            if (idx + 1) % 100 == 0:
+                print(f"    Processing combination {idx + 1}/{len(col_combinations_2)}...")
+            try:
+                rule_stats = working_df.groupBy(col1, col2).agg(
+                    F.count("*").alias("total_count"),
+                    F.sum(F.col(target_flag).cast("int")).alias("fraud_count"),
+                    F.sum(
+                        F.when(F.col(target_flag) == 1, F.col(target_amt)).otherwise(0)
+                    ).alias("fraud_amount_sum"),
+                    F.avg(
+                        F.when(F.col(target_flag) == 1, F.col(target_amt)).otherwise(None)
+                    ).alias("avg_fraud_amount")
+                ).filter(
+                    (F.col("total_count") >= min_support)
+                ).collect()
+                
+                for row in rule_stats:
+                    value1 = row[col1]
+                    value2 = row[col2]
+                    count = row['total_count']
+                    fraud_count = row['fraud_count'] or 0
+                    fraud_amount = row['fraud_amount_sum'] or 0
+                    avg_fraud_amt = row['avg_fraud_amount'] or 0
+                    
+                    if count >= min_support and count > 0:
+                        hit_rate = fraud_count / count
+                        if hit_rate >= min_hit_rate:
+                            rule = {
+                                'rule_description': f"{col1} = '{value1}' AND {col2} = '{value2}'",
+                                'rule_columns': f"{col1} | {col2}",
+                                'rule_values': f"{value1} | {value2}",
+                                'combination_depth': 2,
+                                'total_records': count,
+                                'fraud_count': fraud_count,
+                                'hit_rate': hit_rate,
+                                'fraud_amount_sum': fraud_amount,
+                                'avg_fraud_amount': avg_fraud_amt,
+                                'lift': hit_rate / overall_fraud_rate if overall_fraud_rate > 0 else 0,
+                                'fraud_capture_rate': fraud_count / total_fraud if total_fraud > 0 else 0
+                            }
+                            two_var_rules.append(rule)
+            except Exception as e:
+                continue
+        
+        all_rules.extend(two_var_rules)
+        print(f"  Two-variable rules found: {len(two_var_rules)}")
+    
+    if max_combination_depth >= 3:
+        print("\n[STEP 6] Generating three-variable combination rules...")
+        single_rule_cols = set()
+        for rule in all_rules:
+            if rule['combination_depth'] == 1:
+                single_rule_cols.add(rule['rule_columns'])
+        
+        top_columns = list(single_rule_cols)[:15]
+        three_var_rules = []
+        col_combinations_3 = list(combinations(top_columns, 3))
+        print(f"  Total 3-variable combinations to test: {len(col_combinations_3)}")
+        
+        for idx, (col1, col2, col3) in enumerate(col_combinations_3):
+            if (idx + 1) % 50 == 0:
+                print(f"    Processing combination {idx + 1}/{len(col_combinations_3)}...")
+            try:
+                rule_stats = working_df.groupBy(col1, col2, col3).agg(
+                    F.count("*").alias("total_count"),
+                    F.sum(F.col(target_flag).cast("int")).alias("fraud_count"),
+                    F.sum(
+                        F.when(F.col(target_flag) == 1, F.col(target_amt)).otherwise(0)
+                    ).alias("fraud_amount_sum"),
+                    F.avg(
+                        F.when(F.col(target_flag) == 1, F.col(target_amt)).otherwise(None)
+                    ).alias("avg_fraud_amount")
+                ).filter(
+                    (F.col("total_count") >= min_support)
+                ).collect()
+                
+                for row in rule_stats:
+                    value1 = row[col1]
+                    value2 = row[col2]
+                    value3 = row[col3]
+                    count = row['total_count']
+                    fraud_count = row['fraud_count'] or 0
+                    fraud_amount = row['fraud_amount_sum'] or 0
+                    avg_fraud_amt = row['avg_fraud_amount'] or 0
+                    
+                    if count >= min_support and count > 0:
+                        hit_rate = fraud_count / count
+                        if hit_rate >= min_hit_rate:
+                            rule = {
+                                'rule_description': f"{col1} = '{value1}' AND {col2} = '{value2}' AND {col3} = '{value3}'",
+                                'rule_columns': f"{col1} | {col2} | {col3}",
+                                'rule_values': f"{value1} | {value2} | {value3}",
+                                'combination_depth': 3,
+                                'total_records': count,
+                                'fraud_count': fraud_count,
+                                'hit_rate': hit_rate,
+                                'fraud_amount_sum': fraud_amount,
+                                'avg_fraud_amount': avg_fraud_amt,
+                                'lift': hit_rate / overall_fraud_rate if overall_fraud_rate > 0 else 0,
+                                'fraud_capture_rate': fraud_count / total_fraud if total_fraud > 0 else 0
+                            }
+                            three_var_rules.append(rule)
+            except Exception as e:
+                continue
+        
+        all_rules.extend(three_var_rules)
+        print(f"  Three-variable rules found: {len(three_var_rules)}")
+    
+    print("\n[STEP 7] Compiling results...")
+    
+    if not all_rules:
+        print("  No rules found meeting the criteria!")
+        return pd.DataFrame()
+    
+    rules_df = pd.DataFrame(all_rules)
+    rules_df = rules_df.sort_values(
+        by=['hit_rate', 'fraud_count', 'fraud_amount_sum'],
+        ascending=[False, False, False]
+    ).reset_index(drop=True)
+    
+    rules_df['rule_rank'] = range(1, len(rules_df) + 1)
+    rules_df['hit_rate_pct'] = rules_df['hit_rate'].apply(lambda x: f"{x:.2%}")
+    rules_df['fraud_capture_rate_pct'] = rules_df['fraud_capture_rate'].apply(lambda x: f"{x:.2%}")
+    
+    print(f"\n{'=' * 80}")
+    print(f"RESULTS SUMMARY")
+    print(f"{'=' * 80}")
+    print(f"  Total rules generated: {len(rules_df)}")
+    print(f"  1-variable rules: {len(rules_df[rules_df['combination_depth'] == 1])}")
+    if max_combination_depth >= 2:
+        print(f"  2-variable rules: {len(rules_df[rules_df['combination_depth'] == 2])}")
+    if max_combination_depth >= 3:
+        print(f"  3-variable rules: {len(rules_df[rules_df['combination_depth'] == 3])}")
+    print(f"  Max hit rate: {rules_df['hit_rate'].max():.2%}")
+    print(f"  Avg hit rate: {rules_df['hit_rate'].mean():.2%}")
+    print(f"  Max lift: {rules_df['lift'].max():.2f}x")
+    
+    print(f"\n  Top 10 Rules:")
+    print(f"  {'-' * 76}")
+    top_10 = rules_df.head(10)
+    for _, row in top_10.iterrows():
+        print(f"  Rank {row['rule_rank']:3d} | Hit Rate: {row['hit_rate_pct']:>7s} | "
+              f"Fraud: {row['fraud_count']:>6,} | Records: {row['total_records']:>8,} | "
+              f"Lift: {row['lift']:.1f}x")
+        print(f"           | Rule: {row['rule_description'][:70]}")
+        print(f"  {'-' * 76}")
+    
+    working_df.unpersist()
+    sp_df.unpersist()
+    
+    return rules_df
+
+# =============================================================================
+# FUNCTION 2: APPLY RULES TO DATAFRAME
+# =============================================================================
+
+def apply_rules_to_dataframe(
+    sp_df: DataFrame,
+    rules_df: pd.DataFrame,
+    target_flag: str = "fraud_trans",
+    top_n_rules: int = None
+):
+    if top_n_rules:
+        rules_to_apply = rules_df.head(top_n_rules)
+    else:
+        rules_to_apply = rules_df
+    
+    flagged_df = sp_df
+    rule_columns = []
+    
+    for idx, row in rules_to_apply.iterrows():
+        rule_col_name = f"rule_{row['rule_rank']}"
+        rule_columns.append(rule_col_name)
+        
+        columns = row['rule_columns'].split(' | ')
+        values = row['rule_values'].split(' | ')
+        
+        condition = None
+        for col, val in zip(columns, values):
+            col = col.strip()
+            val = val.strip()
+            
+            if val == 'None' or val == 'null':
+                cond = F.col(col).isNull()
+            else:
+                try:
+                    numeric_val = float(val)
+                    cond = F.col(col) == numeric_val
+                except (ValueError, TypeError):
+                    cond = F.col(col) == val
+            
+            if condition is None:
+                condition = cond
+            else:
+                condition = condition & cond
+        
+        flagged_df = flagged_df.withColumn(
+            rule_col_name,
+            F.when(condition, 1).otherwise(0)
+        )
+    
+    if rule_columns:
+        combined_expr = F.lit(0)
+        for rc in rule_columns:
+            combined_expr = combined_expr + F.col(rc)
+        
+        flagged_df = flagged_df.withColumn(
+            "any_rule_triggered",
+            F.when(combined_expr > 0, 1).otherwise(0)
+        )
+        flagged_df = flagged_df.withColumn(
+            "num_rules_triggered",
+            combined_expr
+        )
+    
+    print("\n" + "=" * 80)
+    print("RULE APPLICATION PERFORMANCE")
+    print("=" * 80)
+    
+    total = flagged_df.count()
+    total_fraud = flagged_df.filter(F.col(target_flag) == 1).count()
+    triggered = flagged_df.filter(F.col("any_rule_triggered") == 1)
+    triggered_count = triggered.count()
+    triggered_fraud = triggered.filter(F.col(target_flag) == 1).count()
+    
+    print(f"  Total records: {total:,}")
+    print(f"  Records flagged by any rule: {triggered_count:,} ({triggered_count/total:.2%})")
+    print(f"  Fraud captured: {triggered_fraud:,} / {total_fraud:,} ({triggered_fraud/total_fraud:.2%})")
+    if triggered_count > 0:
+        print(f"  Precision (hit rate) of combined rules: {triggered_fraud/triggered_count:.2%}")
+    
+    return flagged_df
+
+# =============================================================================
+# FUNCTION 3: NUMERIC THRESHOLD RULES
+# =============================================================================
+
+def generate_numeric_threshold_rules(
+    sp_df: DataFrame,
+    target_flag: str = "fraud_trans",
+    target_amt: str = "fraud_amt",
+    min_hit_rate: float = 0.10,
+    min_support: int = 100,
+    exclude_patterns: Optional[List[str]] = None,
+    percentile_thresholds: List[float] = None
+):
+    if exclude_patterns is None:
+        exclude_patterns = [
+            'id', 'ID', 'Id', '_id', '_ID',
+            'date', 'Date', 'DATE', '_dt', '_DT',
+            'time', 'Time', 'TIME', 'timestamp',
+            'key', 'Key', 'KEY',
+            'name', 'Name', 'NAME',
+            'address', 'phone', 'email', 'ssn',
+            'account_number', 'acct_no', 'card_number',
+            'ip_address', 'uuid'
+        ]
+    
+    if percentile_thresholds is None:
+        percentile_thresholds = [0.05, 0.10, 0.20, 0.30, 0.40, 0.50,
+                                  0.60, 0.70, 0.80, 0.90, 0.95]
+    
+    print("=" * 80)
+    print("NUMERIC THRESHOLD RULE GENERATION")
+    print("=" * 80)
+    
+    sp_df.cache()
+    total_count = sp_df.count()
+    total_fraud = sp_df.filter(F.col(target_flag) == 1).count()
+    overall_fraud_rate = total_fraud / total_count if total_count > 0 else 0
+    
+    def should_exclude(col_name: str) -> bool:
+        for pattern in exclude_patterns:
+            if pattern.lower() in col_name.lower():
+                return True
+        return False
+    
+    numeric_types = ('int', 'bigint', 'float', 'double', 'decimal')
+    numeric_columns = [
+        col for col, dtype in sp_df.dtypes
+        if dtype in numeric_types
+        and col not in [target_flag, target_amt]
+        and not should_exclude(col)
+    ]
+    
+    print(f"  Numeric columns to analyze: {len(numeric_columns)}")
+    print(f"  Columns: {numeric_columns}")
+    
+    threshold_rules = []
+    
+    for col in numeric_columns:
+        print(f"\n  Processing: {col}")
+        try:
+            percentile_values = sp_df.approxQuantile(col, percentile_thresholds, 0.01)
+            
+            seen = set()
+            unique_thresholds = []
+            for pct, val in zip(percentile_thresholds, percentile_values):
+                if val not in seen:
+                    seen.add(val)
+                    unique_thresholds.append((pct, val))
+            
+            for pct, threshold in unique_thresholds:
+                # Test: column > threshold
+                above_stats = sp_df.filter(F.col(col) > threshold).agg(
+                    F.count("*").alias("total_count"),
+                    F.sum(F.col(target_flag).cast("int")).alias("fraud_count"),
+                    F.sum(
+                        F.when(F.col(target_flag) == 1, F.col(target_amt)).otherwise(0)
+                    ).alias("fraud_amount_sum")
+                ).collect()[0]
+                
+                count_above = above_stats['total_count']
+                fraud_above = above_stats['fraud_count'] or 0
+                fraud_amt_above = above_stats['fraud_amount_sum'] or 0
+                
+                if count_above >= min_support and count_above > 0:
+                    hit_rate_above = fraud_above / count_above
+                    if hit_rate_above >= min_hit_rate:
+                        threshold_rules.append({
+                            'rule_description': f"{col} > {threshold:.4f} (P{pct*100:.0f})",
+                            'rule_columns': col,
+                            'rule_type': 'greater_than',
+                            'threshold_value': threshold,
+                            'percentile': pct,
+                            'combination_depth': 1,
+                            'total_records': count_above,
+                            'fraud_count': fraud_above,
+                            'hit_rate': hit_rate_above,
+                            'fraud_amount_sum': fraud_amt_above,
+                            'lift': hit_rate_above / overall_fraud_rate if overall_fraud_rate > 0 else 0,
+                            'fraud_capture_rate': fraud_above / total_fraud if total_fraud > 0 else 0
+                        })
+                
+                # Test: column <= threshold
+                below_stats = sp_df.filter(F.col(col) <= threshold).agg(
+                    F.count("*").alias("total_count"),
+                    F.sum(F.col(target_flag).cast("int")).alias("fraud_count"),
+                    F.sum(
+                        F.when(F.col(target_flag) == 1, F.col(target_amt)).otherwise(0)
+                    ).alias("fraud_amount_sum")
+                ).collect()[0]
+                
+                count_below = below_stats['total_count']
+                fraud_below = below_stats['fraud_count'] or 0
+                fraud_amt_below = below_stats['fraud_amount_sum'] or 0
+                
+                if count_below >= min_support and count_below > 0:
+                    hit_rate_below = fraud_below / count_below
+                    if hit_rate_below >= min_hit_rate:
+                        threshold_rules.append({
+                            'rule_description': f"{col} <= {threshold:.4f} (P{pct*100:.0f})",
+                            'rule_columns': col,
+                            'rule_type': 'less_than_equal',
+                            'threshold_value': threshold,
+                            'percentile': pct,
+                            'combination_depth': 1,
+                            'total_records': count_below,
+                            'fraud_count': fraud_below,
+                            'hit_rate': hit_rate_below,
+                            'fraud_amount_sum': fraud_amt_below,
+                            'lift': hit_rate_below / overall_fraud_rate if overall_fraud_rate > 0 else 0,
+                            'fraud_capture_rate': fraud_below / total_fraud if total_fraud > 0 else 0
+                        })
+                        
+        except Exception as e:
+            print(f"    Warning: Error processing {col}: {str(e)}")
+            continue
+    
+    # Range-based rules
+    print("\n  Generating range-based rules...")
+    for col in numeric_columns:
+        try:
+            percentile_values = sp_df.approxQuantile(col, percentile_thresholds, 0.01)
+            
+            for i in range(len(percentile_thresholds)):
+                for j in range(i + 1, len(percentile_thresholds)):
+                    low_val = percentile_values[i]
+                    high_val = percentile_values[j]
+                    
+                    if low_val == high_val:
+                        continue
+                    
+                    range_stats = sp_df.filter(
+                        (F.col(col) > low_val) & (F.col(col) <= high_val)
+                    ).agg(
+                        F.count("*").alias("total_count"),
+                        F.sum(F.col(target_flag).cast("int")).alias("fraud_count"),
+                        F.sum(
+                            F.when(F.col(target_flag) == 1, F.col(target_amt)).otherwise(0)
+                        ).alias("fraud_amount_sum")
+                    ).collect()[0]
+                    
+                    count_range = range_stats['total_count']
+                    fraud_range = range_stats['fraud_count'] or 0
+                    fraud_amt_range = range_stats['fraud_amount_sum'] or 0
+                    
+                    if count_range >= min_support and count_range > 0:
+                        hit_rate_range = fraud_range / count_range
+                        if hit_rate_range >= min_hit_rate:
+                            threshold_rules.append({
+                                'rule_description': f"{col} BETWEEN ({low_val:.4f}, {high_val:.4f}]",
+                                'rule_columns': col,
+                                'rule_type': 'range',
+                                'threshold_value': f"{low_val:.4f} - {high_val:.4f}",
+                                'percentile': f"{percentile_thresholds[i]} - {percentile_thresholds[j]}",
+                                'combination_depth': 1,
+                                'total_records': count_range,
+                                'fraud_count': fraud_range,
+                                'hit_rate': hit_rate_range,
+                                'fraud_amount_sum': fraud_amt_range,
+                                'lift': hit_rate_range / overall_fraud_rate if overall_fraud_rate > 0 else 0,
+                                'fraud_capture_rate': fraud_range / total_fraud if total_fraud > 0 else 0
+                            })
+        except Exception as e:
+            continue
+    
+    if not threshold_rules:
+        print("\n  No threshold rules found meeting criteria!")
+        return pd.DataFrame()
+    
+    threshold_rules_df = pd.DataFrame(threshold_rules)
+    threshold_rules_df = threshold_rules_df.sort_values(
+        by=['hit_rate', 'fraud_count'],
+        ascending=[False, False]
+    ).reset_index(drop=True)
+    threshold_rules_df['rule_rank'] = range(1, len(threshold_rules_df) + 1)
+    
+    print(f"\n  Total threshold rules found: {len(threshold_rules_df)}")
+    print(f"  Max hit rate: {threshold_rules_df['hit_rate'].max():.2%}")
+    print(f"  Max lift: {threshold_rules_df['lift'].max():.2f}x")
+    
+    sp_df.unpersist()
+    return threshold_rules_df
+
+# =============================================================================
+# FUNCTION 4: COMBINE AND RANK ALL RULES
+# =============================================================================
+
+def combine_and_rank_all_rules(
+    categorical_rules: pd.DataFrame,
+    threshold_rules: pd.DataFrame,
+    remove_redundant: bool = True
+):
+    print("=" * 80)
+    print("COMBINING AND RANKING ALL RULES")
+    print("=" * 80)
+    
+    if 'rule_type' not in categorical_rules.columns:
+        categorical_rules['rule_type'] = 'categorical'
+    if 'threshold_value' not in categorical_rules.columns:
+        categorical_rules['threshold_value'] = None
+    if 'percentile' not in categorical_rules.columns:
+        categorical_rules['percentile'] = None
+    
+    if 'rule_values' not in threshold_rules.columns:
+        threshold_rules['rule_values'] = threshold_rules['threshold_value'].astype(str)
+    if 'avg_fraud_amount' not in threshold_rules.columns:
+        threshold_rules['avg_fraud_amount'] = (
+            threshold_rules['fraud_amount_sum'] / threshold_rules['fraud_count']
+        ).fillna(0)
+    
+    common_cols = [
+        'rule_description', 'rule_columns', 'rule_type', 'combination_depth',
+        'total_records', 'fraud_count', 'hit_rate', 'fraud_amount_sum',
+        'lift', 'fraud_capture_rate'
+    ]
+    
+    cat_subset = categorical_rules[[c for c in common_cols if c in categorical_rules.columns]]
+    thr_subset = threshold_rules[[c for c in common_cols if c in threshold_rules.columns]]
+    
+    combined = pd.concat([cat_subset, thr_subset], ignore_index=True)
+    
+    combined['composite_score'] = combined['hit_rate'] * np.log1p(combined['fraud_count']) * combined['lift']
+    
+    combined = combined.sort_values(
+        by=['composite_score', 'hit_rate', 'fraud_count'],
+        ascending=[False, False, False]
+    ).reset_index(drop=True)
+    
+    combined['final_rank'] = range(1, len(combined) + 1)
+    combined['hit_rate_pct'] = combined['hit_rate'].apply(lambda x: f"{x:.2%}")
+    combined['fraud_capture_pct'] = combined['fraud_capture_rate'].apply(lambda x: f"{x:.2%}")
+    
+    if remove_redundant:
+        print(f"  Rules before redundancy removal: {len(combined)}")
+        combined = combined.drop_duplicates(subset=['rule_description'], keep='first')
+        print(f"  Rules after redundancy removal: {len(combined)}")
+    
+    print(f"\n  FINAL RULE COUNT: {len(combined)}")
+    print(f"\n  Top 20 Rules by Composite Score:")
+    print(f"  {'='*76}")
+    
+    for _, row in combined.head(20).iterrows():
+        print(f"  #{row['final_rank']:3d} | Hit Rate: {row['hit_rate_pct']:>7s} | "
+              f"Lift: {row['lift']:>5.1f}x | Fraud: {row['fraud_count']:>6,} | "
+              f"Records: {row['total_records']:>8,}")
+        print(f"       | Rule: {row['rule_description'][:70]}")
+        print(f"  {'-'*76}")
+    
+    return combined
+
+# =============================================================================
+# FUNCTION 5: EXPORT RULES TO PYSPARK CONDITIONS
+# =============================================================================
+
+def export_rules_to_pyspark_conditions(rules_df: pd.DataFrame, top_n: int = 50):
+    print("=" * 80)
+    print("EXPORTING RULES AS PYSPARK CONDITIONS")
+    print("=" * 80)
+    
+    top_rules = rules_df.head(top_n)
+    pyspark_conditions = []
+    
+    for idx, row in top_rules.iterrows():
+        rule_desc = row['rule_description']
+        rule_type = row.get('rule_type', 'categorical')
+        condition_str = ""
+        
+        if rule_type == 'categorical':
+            parts = rule_desc.split(' AND ')
+            conditions = []
+            for part in parts:
+                part = part.strip()
+                if " = " in part:
+                    col_part, val_part = part.split(" = ", 1)
+                    col_part = col_part.strip()
+                    val_part = val_part.strip().strip("'")
+                    if val_part == 'None' or val_part == 'null':
+                        conditions.append(f"F.col('{col_part}').isNull()")
+                    else:
+                        try:
+                            float(val_part)
+                            conditions.append(f"F.col('{col_part}') == {val_part}")
+                        except (ValueError, TypeError):
+                            conditions.append(f"F.col('{col_part}') == '{val_part}'")
+            condition_str = " & ".join([f"({c})" for c in conditions])
+            
+        elif rule_type == 'greater_than':
+            col = row['rule_columns']
+            threshold = row.get('threshold_value', 0)
+            if isinstance(threshold, str):
+                threshold = float(threshold.split(' - ')[0])
+            condition_str = f"F.col('{col}') > {threshold}"
+            
+        elif rule_type == 'less_than_equal':
+            col = row['rule_columns']
+            threshold = row.get('threshold_value', 0)
+            if isinstance(threshold, str):
+                threshold = float(threshold.split(' - ')[0])
+            condition_str = f"F.col('{col}') <= {threshold}"
+            
+        elif rule_type == 'range':
+            col = row['rule_columns']
+            threshold = row.get('threshold_value', '0 - 0')
+            if isinstance(threshold, str) and ' - ' in threshold:
+                low, high = threshold.split(' - ')
+                condition_str = f"(F.col('{col}') > {float(low.strip())}) & (F.col('{col}') <= {float(high.strip())})"
+            else:
+                condition_str = f"# Could not parse range for {col}"
+        
+        pyspark_conditions.append({
+            'rule_rank': row.get('final_rank', idx + 1),
+            'rule_description': rule_desc,
+            'hit_rate': row['hit_rate'],
+            'fraud_count': row['fraud_count'],
+            'total_records': row['total_records'],
+            'lift': row['lift'],
+            'pyspark_condition': condition_str
+        })
+    
+    print("\n# ============ COPY-PASTE READY PYSPARK CODE ============\n")
+    print("from pyspark.sql import functions as F\n")
+    for rule in pyspark_conditions[:10]:
+        print(f"# Rule #{rule['rule_rank']}: Hit Rate={rule['hit_rate']:.2%}, Lift={rule['lift']:.1f}x")
+        print(f"# {rule['rule_description']}")
+        print(f"sp_df = sp_df.withColumn('rule_{rule['rule_rank']}_flag',")
+        print(f"    F.when({rule['pyspark_condition']}, 1).otherwise(0))\n")
+    
+    return pyspark_conditions
+
+# =============================================================================
+# FUNCTION 6: OVERLAP ANALYSIS
+# =============================================================================
+
+def generate_rule_overlap_analysis(
+    sp_df: DataFrame,
+    rules_df: pd.DataFrame,
+    target_flag: str = "fraud_trans",
+    top_n_rules: int = 20
+):
+    print("=" * 80)
+    print("RULE OVERLAP & OPTIMIZATION ANALYSIS")
+    print("=" * 80)
+    
+    top_rules = rules_df.head(top_n_rules)
+    flagged_df = sp_df
+    rule_col_names = []
+    
+    for idx, row in top_rules.iterrows():
+        rule_rank = row.get('final_rank', idx + 1)
+        rule_col = f"rule_{rule_rank}"
+        rule_col_names.append(rule_col)
+        
+        rule_desc = row['rule_description']
+        rule_type = row.get('rule_type', 'categorical')
+        
+        condition = None
+        
+        if rule_type == 'categorical':
+            parts = rule_desc.split(' AND ')
+            for part in parts:
+                part = part.strip()
+                if " = " in part:
+                    col_part, val_part = part.split(" = ", 1)
+                    col_part = col_part.strip()
+                    val_part = val_part.strip().strip("'")
+                    
+                    if val_part == 'None' or val_part == 'null':
+                        cond = F.col(col_part).isNull()
+                    else:
+                        try:
+                            numeric_val = float(val_part)
+                            cond = F.col(col_part) == numeric_val
+                        except (ValueError, TypeError):
+                            cond = F.col(col_part) == val_part
+                    
+                    condition = cond if condition is None else (condition & cond)
+                    
+        elif rule_type == 'greater_than':
+            col = row['rule_columns']
+            threshold = row.get('threshold_value', 0)
+            if isinstance(threshold, str):
+                threshold = float(threshold.split(' - ')[0])
+            condition = F.col(col) > threshold
+            
+        elif rule_type == 'less_than_equal':
+            col = row['rule_columns']
+            threshold = row.get('threshold_value', 0)
+            if isinstance(threshold, str):
+                threshold = float(threshold.split(' - ')[0])
+            condition = F.col(col) <= threshold
+            
+        elif rule_type == 'range':
+            col = row['rule_columns']
+            threshold = row.get('threshold_value', '0 - 0')
+            if isinstance(threshold, str) and ' - ' in threshold:
+                low, high = threshold.split(' - ')
+                condition = (F.col(col) > float(low.strip())) & (F.col(col) <= float(high.strip()))
+            else:
+                condition = F.lit(False)
+        else:
+            condition = F.lit(False)
+        
+        if condition is not None:
+            flagged_df = flagged_df.withColumn(rule_col, F.when(condition, 1).otherwise(0))
+        else:
+            flagged_df = flagged_df.withColumn(rule_col, F.lit(0))
+    
+    flagged_df.cache()
+    
+    # Calculate overlap matrix
+    print("\n  Computing overlap matrix...")
+    n_rules = len(rule_col_names)
+    overlap_matrix = np.zeros((n_rules, n_rules))
+    
+    for i in range(n_rules):
+        for j in range(i, n_rules):
+            if i == j:
+                count = flagged_df.filter(F.col(rule_col_names[i]) == 1).count()
+                overlap_matrix[i][j] = count
+            else:
+                overlap_count = flagged_df.filter(
+                    (F.col(rule_col_names[i]) == 1) & (F.col(rule_col_names[j]) == 1)
+                ).count()
+                
+                count_i = overlap_matrix[i][i] if overlap_matrix[i][i] > 0 else 1
+                count_j = flagged_df.filter(F.col(rule_col_names[j]) == 1).count()
+                overlap_matrix[j][j] = count_j
+                
+                min_count = min(count_i, count_j)
+                overlap_pct = overlap_count / min_count if min_count > 0 else 0
+                overlap_matrix[i][j] = overlap_pct
+                overlap_matrix[j][i] = overlap_pct
+    
+    overlap_df = pd.DataFrame(
+        overlap_matrix,
+        index=rule_col_names,
+        columns=rule_col_names
+    )
+    
+    # Greedy rule selection
+    print("\n  Running greedy optimization for non-redundant rule set...")
+    total_fraud = flagged_df.filter(F.col(target_flag) == 1).count()
+    
+    optimal_rule_set = []
+    remaining_rules = list(range(n_rules))
+    cumulative_fraud_captured = set()
+    
+    flagged_df = flagged_df.withColumn("_row_id", F.monotonically_increasing_id())
+    
+    rule_fraud_sets = {}
+    for i, rule_col in enumerate(rule_col_names):
+        fraud_ids = flagged_df.filter(
+            (F.col(rule_col) == 1) & (F.col(target_flag) == 1)
+        ).select("_row_id").rdd.flatMap(lambda x: x).collect()
+        rule_fraud_sets[i] = set(fraud_ids)
+    
+    for iteration in range(min(n_rules, 10)):
+        best_rule = None
+        best_marginal_gain = 0
+        
+        for rule_idx in remaining_rules:
+            marginal_gain = len(rule_fraud_sets[rule_idx] - cumulative_fraud_captured)
+            if marginal_gain > best_marginal_gain:
+                best_marginal_gain = marginal_gain
+                best_rule = rule_idx
+        
+        if best_rule is None or best_marginal_gain == 0:
+            break
+        
+        cumulative_fraud_captured.update(rule_fraud_sets[best_rule])
+        optimal_rule_set.append({
+            'iteration': iteration + 1,
+            'rule_name': rule_col_names[best_rule],
+            'rule_description': top_rules.iloc[best_rule]['rule_description'],
+            'marginal_fraud_captured': best_marginal_gain,
+            'cumulative_fraud_captured': len(cumulative_fraud_captured),
+            'cumulative_capture_rate': len(cumulative_fraud_captured) / total_fraud if total_fraud > 0 else 0
+        })
+        remaining_rules.remove(best_rule)
+    
+    optimal_df = pd.DataFrame(optimal_rule_set)
+    
+    print(f"\n  Optimal Non-Redundant Rule Set:")
+    print(f"  {'='*76}")
+    for _, row in optimal_df.iterrows():
+        print(f"  #{row['iteration']:2d} | +{row['marginal_fraud_captured']:>5,} fraud | "
+              f"Cumulative: {row['cumulative_capture_rate']:.2%} | "
+              f"{row['rule_description'][:50]}")
+    
+    if len(optimal_df) > 0:
+        print(f"\n  Total fraud captured by optimal set: "
+              f"{optimal_df['cumulative_fraud_captured'].max():,} / {total_fraud:,} "
+              f"({optimal_df['cumulative_capture_rate'].max():.2%})")
+    
+    flagged_df.unpersist()
+    
+    return overlap_df, optimal_df
+
+# =============================================================================
+# FUNCTION 7: MASTER PIPELINE
+# =============================================================================
+
+def run_full_rule_generation_pipeline(
+    sp_df: DataFrame,
+    target_flag: str = "fraud_trans",
+    target_amt: str = "fraud_amt",
+    min_hit_rate: float = 0.10,
+    min_support: int = 100,
+    max_combination_depth: int = 3,
+    max_cardinality: int = 50,
+    exclude_patterns: Optional[List[str]] = None,
+    export_path: Optional[str] = None
+):
+    print("\n" + "#" * 80)
+    print("#" + " " * 25 + "FRAUD RULE GENERATION PIPELINE" + " " * 23 + "#")
+    print("#" * 80 + "\n")
+    
+    results = {}
+    
+    # PHASE 1
+    print("\n" + "~" * 80)
+    print("PHASE 1: CATEGORICAL & BINNED RULES")
+    print("~" * 80)
+    
+    categorical_rules = generate_fraud_rules(
+        sp_df=sp_df,
+        target_flag=target_flag,
+        target_amt=target_amt,
+        min_hit_rate=min_hit_rate,
+        max_cardinality=max_cardinality,
+        min_support=min_support,
+        max_combination_depth=max_combination_depth,
+        exclude_patterns=exclude_patterns
+    )
+    results['categorical_rules'] = categorical_rules
+    
+    # PHASE 2
+    print("\n" + "~" * 80)
+    print("PHASE 2: NUMERIC THRESHOLD RULES")
+    print("~" * 80)
+    
+    threshold_rules = generate_numeric_threshold_rules(
+        sp_df=sp_df,
+        target_flag=target_flag,
+        target_amt=target_amt,
+        min_hit_rate=min_hit_rate,
+        min_support=min_support,
+        exclude_patterns=exclude_patterns
+    )
+    results['threshold_rules'] = threshold_rules
+    
+    # PHASE 3
+    print("\n" + "~" * 80)
+    print("PHASE 3: COMBINE & RANK")
+    print("~" * 80)
+    
+    if len(categorical_rules) > 0 and len(threshold_rules) > 0:
+        combined_rules = combine_and_rank_all_rules(
+            categorical_rules=categorical_rules,
+            threshold_rules=threshold_rules,
+            remove_redundant=True
+        )
+    elif len(categorical_rules) > 0:
+        combined_rules = categorical_rules.copy()
+        combined_rules['final_rank'] = range(1, len(combined_rules) + 1)
+    elif len(threshold_rules) > 0:
+        combined_rules = threshold_rules.copy()
+        combined_rules['final_rank'] = range(1, len(combined_rules) + 1)
+    else:
+        combined_rules = pd.DataFrame()
+        print("  WARNING: No rules found!")
+    
+    results['combined_rules'] = combined_rules
+    
+    # PHASE 4 & 5
+    if len(combined_rules) > 0:
+        print("\n" + "~" * 80)
+        print("PHASE 4: EXPORT PYSPARK CONDITIONS")
+        print("~" * 80)
+        
+        pyspark_conditions = export_rules_to_pyspark_conditions(
+            rules_df=combined_rules,
+            top_n=min(50, len(combined_rules))
+        )
+        results['pyspark_conditions'] = pyspark_conditions
+        
+        print("\n" + "~" * 80)
+        print("PHASE 5: OVERLAP & OPTIMIZATION")
+        print("~" * 80)
+        
+        try:
+            overlap_matrix, optimal_set = generate_rule_overlap_analysis(
+                sp_df=sp_df,
+                rules_df=combined_rules,
+                target_flag=target_flag,
+                top_n_rules=min(20, len(combined_rules))
+            )
+            results['overlap_analysis'] = overlap_matrix
+            results['optimal_rule_set'] = optimal_set
+        except Exception as e:
+            print(f"  WARNING: Overlap analysis failed: {str(e)}")
+            results['overlap_analysis'] = pd.DataFrame()
+            results['optimal_rule_set'] = pd.DataFrame()
+    
+    # PHASE 6
+    if export_path and len(combined_rules) > 0:
+        print("\n" + "~" * 80)
+        print("PHASE 6: EXPORTING RESULTS")
+        print("~" * 80)
+        try:
+            combined_rules.to_csv(f"{export_path}/combined_rules.csv", index=False)
+            print(f"  Exported to: {export_path}/combined_rules.csv")
+        except Exception as e:
+            print(f"  WARNING: Export failed: {str(e)}")
+    
+    # FINAL SUMMARY
+    print("\n" + "#" * 80)
+    print("PIPELINE COMPLETE")
+    print("#" * 80)
+    print(f"  Total categorical rules:  {len(results.get('categorical_rules', []))}")
+    print(f"  Total threshold rules:    {len(results.get('threshold_rules', []))}")
+    print(f"  Total combined rules:     {len(results.get('combined_rules', []))}")
+    
+    if 'optimal_rule_set' in results and len(results['optimal_rule_set']) > 0:
+        opt = results['optimal_rule_set']
+        print(f"  Optimal rule set size:    {len(opt)}")
+        print(f"  Max fraud capture rate:   {opt['cumulative_capture_rate'].max():.2%}")
+    
+    return results
+
+# =============================================================================
+# RUN THE PIPELINE
+# =============================================================================
+
+results = run_full_rule_generation_pipeline(
+    sp_df=sp_df,
+    target_flag="fraud_trans",
+    target_amt="fraud_amt",
+    min_hit_rate=0.10,
+    min_support=100,
+    max_combination_depth=3,
+    max_cardinality=50,
+    export_path=None
+)
+
+# Access your rules
+all_rules = results['combined_rules']
+print(all_rules.head(20))
+
+
+
+
+
+# =============================================================================
+# Cell 2: METHOD 1: SIMPLEST - Run entire pipeline (recommended)
+# =============================================================================
+
+results = run_full_rule_generation_pipeline(
+    sp_df=sp_df,                    # your PySpark DataFrame
+    target_flag="fraud_trans",       # binary fraud column (1/0)
+    target_amt="fraud_amt",          # fraud amount column
+    min_hit_rate=0.10,              # minimum 10% hit rate
+    min_support=100,                # minimum 100 records per rule
+    max_combination_depth=3,        # up to 3-variable combinations
+    max_cardinality=50,             # max distinct values for categorical
+    export_path=None                # set path to save CSVs e.g. "/dbfs/output/"
+)
+
+# Access results
+all_rules = results['combined_rules']              # all rules in pandas DataFrame
+categorical_rules = results['categorical_rules']   # categorical rules only
+threshold_rules = results['threshold_rules']       # numeric threshold rules only
+optimal_rules = results['optimal_rule_set']        # best non-redundant rules
+pyspark_code = results['pyspark_conditions']       # ready PySpark conditions
+
+# =============================================================================
+# METHOD 2: Call individual functions separately
+# =============================================================================
+
+# Step A: Generate categorical rules only
+cat_rules = generate_fraud_rules(
+    sp_df=sp_df,
+    target_flag="fraud_trans",
+    target_amt="fraud_amt",
+    min_hit_rate=0.10,
+    min_support=100,
+    max_combination_depth=2          # only 1 and 2 variable combos
+)
+
+# Step B: Generate numeric threshold rules only
+thr_rules = generate_numeric_threshold_rules(
+    sp_df=sp_df,
+    target_flag="fraud_trans",
+    target_amt="fraud_amt",
+    min_hit_rate=0.10,
+    min_support=100
+)
+
+# Step C: Combine them
+combined = combine_and_rank_all_rules(
+    categorical_rules=cat_rules,
+    threshold_rules=thr_rules,
+    remove_redundant=True
+)
+
+# Step D: Get PySpark conditions
+conditions = export_rules_to_pyspark_conditions(
+    rules_df=combined,
+    top_n=20
+)
+
+# Step E: Run overlap analysis
+overlap_matrix, optimal_set = generate_rule_overlap_analysis(
+    sp_df=sp_df,
+    rules_df=combined,
+    target_flag="fraud_trans",
+    top_n_rules=15
+)
+
+# =============================================================================
+# METHOD 3: Apply rules to flag your DataFrame
+# =============================================================================
+
+flagged_df = apply_rules_to_dataframe(
+    sp_df=sp_df,
+    rules_df=all_rules,             # pass rules from any method above
+    target_flag="fraud_trans",
+    top_n_rules=10                  # apply top 10 rules only
+)
+
+# See flagged records
+flagged_df.filter(F.col("any_rule_triggered") == 1).show(20)
+
+# See how many rules each record triggered
+flagged_df.groupBy("num_rules_triggered").count().orderBy("num_rules_triggered").show()
+
+# =============================================================================
+# METHOD 4: Quick run with different parameters
+# =============================================================================
+
+# More strict (higher hit rate, more support)
+strict_results = run_full_rule_generation_pipeline(
+    sp_df=sp_df,
+    target_flag="fraud_trans",
+    target_amt="fraud_amt",
+    min_hit_rate=0.25,              # 25% minimum hit rate
+    min_support=500,                # at least 500 records
+    max_combination_depth=2,        # only 1 and 2 combos (faster)
+    max_cardinality=30
+)
+
+# More lenient (lower hit rate, less support)
+lenient_results = run_full_rule_generation_pipeline(
+    sp_df=sp_df,
+    target_flag="fraud_trans",
+    target_amt="fraud_amt",
+    min_hit_rate=0.05,              # 5% minimum hit rate
+    min_support=50,                 # at least 50 records
+    max_combination_depth=3,
+    max_cardinality=100
+)
+
+# =============================================================================
+# METHOD 5: Export results and save
+# =============================================================================
+
+# Save to CSV
+results = run_full_rule_generation_pipeline(
+    sp_df=sp_df,
+    target_flag="fraud_trans",
+    target_amt="fraud_amt",
+    min_hit_rate=0.10,
+    min_support=100,
+    max_combination_depth=3,
+    max_cardinality=50,
+    export_path="/dbfs/FileStore/fraud_rules/"   # saves CSVs here
+)
+
+# Or manually save
+results['combined_rules'].to_csv("my_fraud_rules.csv", index=False)
+results['optimal_rule_set'].to_csv("optimal_rules.csv", index=False)
+
+# =============================================================================
+# METHOD 6: Exclude specific columns
+# =============================================================================
+
+results = run_full_rule_generation_pipeline(
+    sp_df=sp_df,
+    target_flag="fraud_trans",
+    target_amt="fraud_amt",
+    min_hit_rate=0.10,
+    min_support=100,
+    max_combination_depth=3,
+    max_cardinality=50,
+    exclude_patterns=[
+        'id', 'date', 'time', 'key', 'name',       # standard exclusions
+        'customer', 'account', 'card',               # add your own
+        'sequence', 'index', 'row_num'               # add more
+    ]
+)
+
+
+
+
