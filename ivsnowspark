@@ -1,0 +1,1439 @@
+import numpy as np
+import pandas as pd
+from pyspark.sql import DataFrame as SparkDataFrame
+from pyspark.sql import functions as F
+from pyspark.sql.types import StringType, TimestampType, DateType, NumericType
+from scipy import stats
+import warnings
+warnings.filterwarnings('ignore')
+
+
+def calculate_woe_iv(sp_df, target_col, max_bins=20, min_pct=0.05, 
+                     cardinality_threshold=50, date_keywords=None, 
+                     id_keywords=None):
+    """
+    Calculate Weight of Evidence (WOE) and Information Value (IV) for all 
+    eligible variables in a Snowflake Spark DataFrame.
+    
+    Parameters:
+    -----------
+    sp_df : pyspark.sql.DataFrame
+        Input Spark DataFrame (from Snowflake)
+    target_col : str
+        Name of the binary target variable (0/1)
+    max_bins : int
+        Maximum number of bins for numeric variables (default: 20)
+    min_pct : float
+        Minimum percentage of records in each bin (default: 0.05)
+    cardinality_threshold : int
+        Maximum unique values allowed for categorical variables (default: 50)
+    date_keywords : list
+        Keywords to identify date columns by name (default: common date keywords)
+    id_keywords : list
+        Keywords to identify ID columns by name (default: common ID keywords)
+    
+    Returns:
+    --------
+    dict with keys:
+        - 'iv_summary': DataFrame with IV values for each variable
+        - 'woe_details': Dict of DataFrames with WOE details per variable
+        - 'removed_columns': List of removed columns with reasons
+        - 'transformed_df': Spark DataFrame with WOE-transformed variables
+    """
+    
+    if date_keywords is None:
+        date_keywords = ['date', 'dt', 'time', 'timestamp', 'created', 'updated', 
+                         'modified', 'inserted', 'loaded', 'extracted', 'dob', 
+                         'birth', 'start_dt', 'end_dt', 'eff_dt', 'exp_dt']
+    
+    if id_keywords is None:
+        id_keywords = ['id', '_id', 'key', '_key', 'pk', '_pk', 'sk', '_sk',
+                       'uuid', 'guid', 'identifier', 'index', 'idx', 'seq',
+                       'sequence', 'number', 'num', 'no', 'code', 'ssn', 
+                       'phone', 'email', 'address', 'name', 'account_no',
+                       'acct_no', 'policy_no', 'claim_no']
+    
+    # Convert to Pandas for easier manipulation
+    print("Converting Spark DataFrame to Pandas...")
+    pdf = sp_df.toPandas()
+    
+    total_records = len(pdf)
+    print(f"Total records: {total_records}")
+    print(f"Total columns: {len(pdf.columns)}")
+    
+    # Validate target column
+    if target_col not in pdf.columns:
+        raise ValueError(f"Target column '{target_col}' not found in DataFrame")
+    
+    unique_targets = pdf[target_col].dropna().unique()
+    if not set(unique_targets).issubset({0, 1}):
+        raise ValueError(f"Target column must be binary (0/1). Found values: {unique_targets}")
+    
+    # Track removed columns
+    removed_columns = []
+    eligible_columns = []
+    
+    # Get schema info from Spark DataFrame
+    schema_dict = {field.name: field.dataType for field in sp_df.schema.fields}
+    
+    # =========================================================================
+    # STEP 1: Identify and remove date/ID/high-cardinality columns
+    # =========================================================================
+    print("\n" + "="*60)
+    print("STEP 1: Filtering columns...")
+    print("="*60)
+    
+    for col in pdf.columns:
+        if col == target_col:
+            continue
+        
+        remove_reason = None
+        col_lower = col.lower()
+        
+        # Check if column is a date type by Spark schema
+        spark_type = schema_dict.get(col)
+        if isinstance(spark_type, (TimestampType, DateType)):
+            remove_reason = f"Date/Timestamp type detected (Spark type: {spark_type})"
+        
+        # Check if column name matches date keywords
+        if remove_reason is None:
+            for keyword in date_keywords:
+                if keyword.lower() in col_lower:
+                    # Additional check: try to parse as date
+                    if pdf[col].dtype == 'object':
+                        try:
+                            sample = pdf[col].dropna().head(100)
+                            pd.to_datetime(sample)
+                            remove_reason = f"Date column detected (keyword: '{keyword}', parseable as date)"
+                            break
+                        except (ValueError, TypeError):
+                            pass
+                    elif pd.api.types.is_datetime64_any_dtype(pdf[col]):
+                        remove_reason = f"Date column detected (datetime dtype, keyword: '{keyword}')"
+                        break
+        
+        # Check if column name matches ID keywords
+        if remove_reason is None:
+            for keyword in id_keywords:
+                if (col_lower == keyword or 
+                    col_lower.startswith(keyword + '_') or 
+                    col_lower.endswith('_' + keyword) or
+                    col_lower.startswith(keyword) and col_lower[len(keyword):].isdigit()):
+                    
+                    # Verify high cardinality for ID-like columns
+                    n_unique = pdf[col].nunique()
+                    cardinality_ratio = n_unique / total_records
+                    
+                    if cardinality_ratio > 0.5 or n_unique > cardinality_threshold * 10:
+                        remove_reason = (f"ID column detected (keyword: '{keyword}', "
+                                        f"unique values: {n_unique}, "
+                                        f"cardinality ratio: {cardinality_ratio:.4f})")
+                        break
+        
+        # Check high cardinality for string/categorical columns
+        if remove_reason is None:
+            if pdf[col].dtype == 'object' or isinstance(spark_type, StringType):
+                n_unique = pdf[col].nunique()
+                cardinality_ratio = n_unique / total_records
+                
+                if n_unique > cardinality_threshold:
+                    remove_reason = (f"High cardinality categorical "
+                                    f"(unique values: {n_unique}, "
+                                    f"threshold: {cardinality_threshold})")
+                elif cardinality_ratio > 0.9:
+                    remove_reason = (f"Near-unique categorical "
+                                    f"(cardinality ratio: {cardinality_ratio:.4f})")
+        
+        # Check if column has only one unique value
+        if remove_reason is None:
+            if pdf[col].nunique() <= 1:
+                remove_reason = "Constant column (0 or 1 unique values)"
+        
+        # Check if column is all null
+        if remove_reason is None:
+            if pdf[col].isnull().all():
+                remove_reason = "All null values"
+        
+        if remove_reason:
+            removed_columns.append({'column': col, 'reason': remove_reason})
+            print(f"  REMOVED: {col} -> {remove_reason}")
+        else:
+            eligible_columns.append(col)
+    
+    print(f"\nEligible columns for WOE/IV: {len(eligible_columns)}")
+    print(f"Removed columns: {len(removed_columns)}")
+    
+    # =========================================================================
+    # STEP 2: Calculate optimal WOE and IV for each eligible variable
+    # =========================================================================
+    print("\n" + "="*60)
+    print("STEP 2: Calculating WOE and IV...")
+    print("="*60)
+    
+    iv_results = {}
+    woe_details = {}
+    woe_mappings = {}
+    
+    total_events = pdf[target_col].sum()
+    total_non_events = total_records - total_events
+    
+    if total_events == 0 or total_non_events == 0:
+        raise ValueError("Target variable must have both 0 and 1 values")
+    
+    for col in eligible_columns:
+        try:
+            if pd.api.types.is_numeric_dtype(pdf[col]):
+                # Numeric variable - find optimal binning
+                woe_df, iv_value, mapping = _optimal_binning_numeric(
+                    pdf, col, target_col, total_events, total_non_events,
+                    max_bins, min_pct
+                )
+            else:
+                # Categorical variable
+                woe_df, iv_value, mapping = _calculate_woe_categorical(
+                    pdf, col, target_col, total_events, total_non_events
+                )
+            
+            if woe_df is not None and iv_value is not None:
+                iv_results[col] = iv_value
+                woe_details[col] = woe_df
+                woe_mappings[col] = mapping
+                
+                # Determine predictive power
+                power = _get_predictive_power(iv_value)
+                print(f"  {col}: IV = {iv_value:.4f} ({power})")
+            else:
+                removed_columns.append({
+                    'column': col, 
+                    'reason': 'Could not calculate WOE (insufficient data variation)'
+                })
+                
+        except Exception as e:
+            removed_columns.append({
+                'column': col, 
+                'reason': f'Error during WOE calculation: {str(e)}'
+            })
+    
+    # =========================================================================
+    # STEP 3: Create IV summary
+    # =========================================================================
+    print("\n" + "="*60)
+    print("STEP 3: IV Summary")
+    print("="*60)
+    
+    iv_summary = pd.DataFrame({
+        'variable': list(iv_results.keys()),
+        'iv': list(iv_results.values())
+    }).sort_values('iv', ascending=False).reset_index(drop=True)
+    
+    iv_summary['predictive_power'] = iv_summary['iv'].apply(_get_predictive_power)
+    iv_summary['rank'] = range(1, len(iv_summary) + 1)
+    
+    print(iv_summary.to_string(index=False))
+    
+    # =========================================================================
+    # STEP 4: Create WOE-transformed DataFrame
+    # =========================================================================
+    print("\n" + "="*60)
+    print("STEP 4: Creating WOE-transformed DataFrame...")
+    print("="*60)
+    
+    woe_transformed = pdf[[target_col]].copy()
+    
+    for col, mapping in woe_mappings.items():
+        if pd.api.types.is_numeric_dtype(pdf[col]):
+            woe_transformed[col + '_woe'] = _apply_numeric_woe(pdf[col], mapping)
+        else:
+            woe_transformed[col + '_woe'] = pdf[col].map(mapping).fillna(0)
+    
+    # Convert back to Spark DataFrame
+    from pyspark.sql import SparkSession
+    spark = SparkSession.builder.getOrCreate()
+    transformed_sp_df = spark.createDataFrame(woe_transformed)
+    
+    print(f"Transformed DataFrame columns: {len(woe_transformed.columns)}")
+    
+    # =========================================================================
+    # STEP 5: Compile results
+    # =========================================================================
+    removed_df = pd.DataFrame(removed_columns) if removed_columns else pd.DataFrame(
+        columns=['column', 'reason'])
+    
+    results = {
+        'iv_summary': iv_summary,
+        'woe_details': woe_details,
+        'removed_columns': removed_df,
+        'transformed_df': transformed_sp_df,
+        'woe_mappings': woe_mappings
+    }
+    
+    print("\n" + "="*60)
+    print("COMPLETE!")
+    print(f"  Variables with IV calculated: {len(iv_results)}")
+    print(f"  Variables removed: {len(removed_columns)}")
+    print("="*60)
+    
+    return results
+
+
+def _optimal_binning_numeric(pdf, col, target_col, total_events, total_non_events,
+                             max_bins=20, min_pct=0.05):
+    """
+    Find optimal bins for a numeric variable using monotonic binning approach.
+    Uses a combination of quantile-based initial binning and merging based on
+    chi-square statistics to find optimal splits.
+    """
+    # Handle missing values
+    data = pdf[[col, target_col]].copy()
+    missing_mask = data[col].isnull()
+    data_non_missing = data[~missing_mask].copy()
+    
+    if len(data_non_missing) == 0:
+        return None, None, None
+    
+    n_unique = data_non_missing[col].nunique()
+    
+    if n_unique <= 2:
+        # If very few unique values, treat as categorical
+        return _calculate_woe_categorical(pdf, col, target_col, 
+                                          total_events, total_non_events)
+    
+    # Determine initial number of bins
+    initial_bins = min(max_bins, max(n_unique, 5))
+    
+    # Try multiple binning strategies and pick the best one
+    best_iv = -1
+    best_woe_df = None
+    best_mapping = None
+    
+    # Strategy 1: Quantile-based binning with monotonic enforcement
+    for n_bins in range(min(initial_bins, 20), 1, -1):
+        try:
+            bins = _create_quantile_bins(data_non_missing[col], n_bins, min_pct)
+            if bins is None:
+                continue
+            
+            woe_df, iv_value, mapping = _compute_woe_for_bins(
+                data, col, target_col, bins, total_events, total_non_events,
+                missing_mask
+            )
+            
+            if iv_value is not None and iv_value > best_iv:
+                # Check monotonicity
+                if _is_monotonic(woe_df):
+                    best_iv = iv_value
+                    best_woe_df = woe_df
+                    best_mapping = mapping
+                    break
+                elif iv_value > best_iv:
+                    best_iv = iv_value
+                    best_woe_df = woe_df
+                    best_mapping = mapping
+        except Exception:
+            continue
+    
+    # Strategy 2: Decision tree-based optimal binning
+    try:
+        tree_bins = _tree_based_binning(data_non_missing, col, target_col, max_bins, min_pct)
+        if tree_bins is not None:
+            woe_df, iv_value, mapping = _compute_woe_for_bins(
+                data, col, target_col, tree_bins, total_events, total_non_events,
+                missing_mask
+            )
+            if iv_value is not None and iv_value > best_iv:
+                best_iv = iv_value
+                best_woe_df = woe_df
+                best_mapping = mapping
+    except Exception:
+        pass
+    
+    # Strategy 3: Monotonic binning via merging
+    try:
+        mono_bins = _monotonic_binning(data_non_missing, col, target_col, max_bins, min_pct)
+        if mono_bins is not None:
+            woe_df, iv_value, mapping = _compute_woe_for_bins(
+                data, col, target_col, mono_bins, total_events, total_non_events,
+                missing_mask
+            )
+            if iv_value is not None and iv_value > best_iv:
+                best_iv = iv_value
+                best_woe_df = woe_df
+                best_mapping = mapping
+    except Exception:
+        pass
+    
+    if best_woe_df is None:
+        # Fallback: simple equal-frequency binning
+        try:
+            bins = pd.qcut(data_non_missing[col], q=5, duplicates='drop', retbins=True)[1]
+            bins[0] = -np.inf
+            bins[-1] = np.inf
+            woe_df, iv_value, mapping = _compute_woe_for_bins(
+                data, col, target_col, bins, total_events, total_non_events,
+                missing_mask
+            )
+            best_iv = iv_value
+            best_woe_df = woe_df
+            best_mapping = mapping
+        except Exception:
+            return None, None, None
+    
+    return best_woe_df, best_iv, best_mapping
+
+
+def _create_quantile_bins(series, n_bins, min_pct):
+    """Create quantile-based bins ensuring minimum percentage per bin."""
+    try:
+        _, bins = pd.qcut(series, q=n_bins, duplicates='drop', retbins=True)
+        bins[0] = -np.inf
+        bins[-1] = np.inf
+        return bins
+    except Exception:
+        return None
+
+
+def _tree_based_binning(data, col, target_col, max_bins, min_pct):
+    """Use decision tree to find optimal split points."""
+    try:
+        from sklearn.tree import DecisionTreeClassifier
+        
+        X = data[col].values.reshape(-1, 1)
+        y = data[target_col].values
+        
+        # Remove any NaN
+        valid_mask = ~np.isnan(X.ravel())
+        X = X[valid_mask]
+        y = y[valid_mask]
+        
+        if len(X) == 0:
+            return None
+        
+        min_samples = max(int(len(X) * min_pct), 50)
+        
+        tree = DecisionTreeClassifier(
+            max_leaf_nodes=max_bins,
+            min_samples_leaf=min_samples,
+            random_state=42
+        )
+        tree.fit(X, y)
+        
+        # Extract thresholds
+        thresholds = tree.tree_.threshold[tree.tree_.threshold != -2]
+        thresholds = np.sort(np.unique(thresholds))
+        
+        if len(thresholds) == 0:
+            return None
+        
+        bins = np.concatenate([[-np.inf], thresholds, [np.inf]])
+        return bins
+    except ImportError:
+        return None
+    except Exception:
+        return None
+
+
+def _monotonic_binning(data, col, target_col, max_bins, min_pct):
+    """Create monotonic bins by starting with fine bins and merging."""
+    try:
+        # Start with many fine bins
+        n_initial = min(50, data[col].nunique())
+        _, bins = pd.qcut(data[col], q=n_initial, duplicates='drop', retbins=True)
+        
+        if len(bins) <= 2:
+            return None
+        
+        bins[0] = -np.inf
+        bins[-1] = np.inf
+        
+        # Assign bins
+        data_copy = data.copy()
+        data_copy['bin'] = pd.cut(data_copy[col], bins=bins, labels=False, include_lowest=True)
+        
+        # Calculate event rate per bin
+        bin_stats = data_copy.groupby('bin').agg(
+            count=(target_col, 'count'),
+            events=(target_col, 'sum')
+        ).reset_index()
+        bin_stats['event_rate'] = bin_stats['events'] / bin_stats['count']
+        
+        # Merge bins to enforce monotonicity (FIXED: actually calling the function)
+        merged_bins = _merge_for_monotonicity(bin_stats, bins, max_bins, min_pct, total_records)
+
+        return merged_bins
+    except Exception:
+        return None
+
+
+def _merge_for_monotonicity(bin_stats, bins, max_bins, min_pct, total_records):
+    """
+    Merge adjacent bins to enforce monotonicity of event rates.
+    Uses difference in event rates to decide which adjacent bins to merge first.
+    """
+
+    
+    current_bins = list(bins)
+    
+    while True:
+        # Recalculate stats with current bins
+        n_bins = len(current_bins) - 1
+        
+        if n_bins <= 2:
+            break
+        
+        # Check monotonicity
+        event_rates = []
+        for i in range(n_bins):
+            lower = current_bins[i]
+            upper = current_bins[i + 1]
+            mask = (bin_stats['bin'] >= i)  # simplified
+            event_rates.append(bin_stats.iloc[i]['event_rate'] if i < len(bin_stats) else 0)
+        
+        # Check if monotonically increasing or decreasing
+        is_increasing = all(event_rates[i] <= event_rates[i+1] for i in range(len(event_rates)-1))
+        is_decreasing = all(event_rates[i] >= event_rates[i+1] for i in range(len(event_rates)-1))
+        
+        if is_increasing or is_decreasing:
+            break
+        
+        # Find the pair with minimum chi-square and merge
+        min_chi2 = np.inf
+        merge_idx = 0
+        
+        for i in range(len(event_rates) - 1):
+            # Simple difference as proxy for chi-square
+            chi2 = abs(event_rates[i] - event_rates[i+1])
+            if chi2 < min_chi2:
+                min_chi2 = chi2
+                merge_idx = i
+        
+        # Merge bins at merge_idx and merge_idx + 1
+        current_bins.pop(merge_idx + 1)
+        
+        if len(current_bins) <= 2:
+            break
+    
+    # Also enforce max_bins
+    while len(current_bins) - 1 > max_bins:
+        # Merge the pair with smallest chi-square difference
+        min_diff = np.inf
+        merge_idx = 0
+        for i in range(len(current_bins) - 2):
+            diff = current_bins[i+2] - current_bins[i+1] if current_bins[i+2] != np.inf and current_bins[i+1] != -np.inf else np.inf
+            if diff < min_diff:
+                min_diff = diff
+                merge_idx = i
+        current_bins.pop(merge_idx + 1)
+    
+    return np.array(current_bins)
+
+
+def _monotonic_binning(data, col, target_col, max_bins, min_pct):
+    """Create monotonic bins by starting with fine bins and merging."""
+    try:
+        total_records = len(data)
+        n_initial = min(50, data[col].nunique())
+        
+        if n_initial <= 2:
+            return None
+            
+        _, bins = pd.qcut(data[col], q=n_initial, duplicates='drop', retbins=True)
+        
+        if len(bins) <= 2:
+            return None
+        
+        bins[0] = -np.inf
+        bins[-1] = np.inf
+        
+        # Assign bins
+        data_copy = data.copy()
+        data_copy['bin'] = pd.cut(data_copy[col], bins=bins, labels=False, include_lowest=True)
+        
+        # Calculate event rate per bin
+        bin_stats = data_copy.groupby('bin').agg(
+            count=(target_col, 'count'),
+            events=(target_col, 'sum')
+        ).reset_index()
+        bin_stats['event_rate'] = bin_stats['events'] / bin_stats['count']
+        
+        # Merge bins to enforce monotonicity
+        merged_bins = _merge_for_monotonicity(bin_stats, bins, max_bins, min_pct, total_records)
+        
+        return merged_bins
+    except Exception:
+        return None
+
+
+def _compute_woe_for_bins(data, col, target_col, bins, total_events, 
+                          total_non_events, missing_mask):
+    """Compute WOE and IV for given bins."""
+    
+    data_copy = data.copy()
+    
+    # Assign bins for non-missing values
+    non_missing_data = data_copy[~missing_mask].copy()
+    
+    try:
+        non_missing_data['bin'] = pd.cut(non_missing_data[col], bins=bins, 
+                                          include_lowest=True, duplicates='drop')
+    except Exception:
+        return None, None, None
+    
+    # Group by bin
+    grouped = non_missing_data.groupby('bin', observed=True).agg(
+        count=(target_col, 'count'),
+        events=(target_col, 'sum')
+    ).reset_index()
+    
+    grouped['non_events'] = grouped['count'] - grouped['events']
+    
+    # Remove empty bins
+    grouped = grouped[grouped['count'] > 0].reset_index(drop=True)
+    
+    if len(grouped) == 0:
+        return None, None, None
+    
+    # Calculate distribution of events and non-events
+    grouped['pct_events'] = grouped['events'] / total_events
+    grouped['pct_non_events'] = grouped['non_events'] / total_non_events
+    
+    # Apply smoothing to avoid division by zero or log(0)
+    epsilon = 0.5
+    grouped['pct_events_adj'] = np.where(
+        grouped['pct_events'] == 0, 
+        epsilon / total_events, 
+        grouped['pct_events']
+    )
+    grouped['pct_non_events_adj'] = np.where(
+        grouped['pct_non_events'] == 0, 
+        epsilon / total_non_events, 
+        grouped['pct_non_events']
+    )
+    
+    # Calculate WOE
+    grouped['woe'] = np.log(grouped['pct_non_events_adj'] / grouped['pct_events_adj'])
+    
+    # Calculate IV contribution
+    grouped['iv'] = (grouped['pct_non_events_adj'] - grouped['pct_events_adj']) * grouped['woe']
+    
+    # Handle missing values bin
+    missing_data = data_copy[missing_mask]
+    if len(missing_data) > 0:
+        missing_events = missing_data[target_col].sum()
+        missing_non_events = len(missing_data) - missing_events
+        
+        pct_events_missing = max(missing_events / total_events, epsilon / total_events)
+        pct_non_events_missing = max(missing_non_events / total_non_events, epsilon / total_non_events)
+        
+        woe_missing = np.log(pct_non_events_missing / pct_events_missing)
+        iv_missing = (pct_non_events_missing - pct_events_missing) * woe_missing
+        
+        missing_row = pd.DataFrame({
+            'bin': ['Missing'],
+            'count': [len(missing_data)],
+            'events': [missing_events],
+            'non_events': [missing_non_events],
+            'pct_events': [missing_events / total_events],
+            'pct_non_events': [missing_non_events / total_non_events],
+            'pct_events_adj': [pct_events_missing],
+            'pct_non_events_adj': [pct_non_events_missing],
+            'woe': [woe_missing],
+            'iv': [iv_missing]
+        })
+        
+        grouped = pd.concat([grouped, missing_row], ignore_index=True)
+    
+    # Total IV
+    total_iv = grouped['iv'].sum()
+    
+    # Handle infinite IV
+    if np.isinf(total_iv) or np.isnan(total_iv):
+        return None, None, None
+    
+    # Create mapping for transformation
+    mapping = {
+        'bins': bins,
+        'woe_values': grouped[grouped['bin'] != 'Missing']['woe'].values,
+        'bin_labels': grouped[grouped['bin'] != 'Missing']['bin'].values,
+        'missing_woe': grouped[grouped['bin'] == 'Missing']['woe'].values[0] if len(missing_data) > 0 else 0
+    }
+    
+    # Clean up output
+    woe_df = grouped[['bin', 'count', 'events', 'non_events', 'pct_events', 
+                       'pct_non_events', 'woe', 'iv']].copy()
+    woe_df['event_rate'] = woe_df['events'] / woe_df['count']
+    woe_df['pct_total'] = woe_df['count'] / len(data_copy)
+    
+    return woe_df, total_iv, mapping
+
+
+def _calculate_woe_categorical(pdf, col, target_col, total_events, total_non_events):
+    """Calculate WOE and IV for categorical variables."""
+    
+    data = pdf[[col, target_col]].copy()
+    
+    # Handle missing values
+    data[col] = data[col].fillna('__MISSING__')
+    
+    # Group by category
+    grouped = data.groupby(col).agg(
+        count=(target_col, 'count'),
+        events=(target_col, 'sum')
+    ).reset_index()
+    
+    grouped['non_events'] = grouped['count'] - grouped['events']
+    
+    # Remove categories with zero count
+    grouped = grouped[grouped['count'] > 0].reset_index(drop=True)
+    
+    if len(grouped) == 0:
+        return None, None, None
+    
+    # Calculate distributions
+    grouped['pct_events'] = grouped['events'] / total_events
+    grouped['pct_non_events'] = grouped['non_events'] / total_non_events
+    
+    # Apply smoothing
+    epsilon = 0.5
+    grouped['pct_events_adj'] = np.where(
+        grouped['pct_events'] == 0,
+        epsilon / total_events,
+        grouped['pct_events']
+    )
+    grouped['pct_non_events_adj'] = np.where(
+        grouped['pct_non_events'] == 0,
+        epsilon / total_non_events,
+        grouped['pct_non_events']
+    )
+    
+    # Calculate WOE
+    grouped['woe'] = np.log(grouped['pct_non_events_adj'] / grouped['pct_events_adj'])
+    
+    # Calculate IV
+    grouped['iv'] = (grouped['pct_non_events_adj'] - grouped['pct_events_adj']) * grouped['woe']
+    
+    # Total IV
+    total_iv = grouped['iv'].sum()
+    
+    if np.isinf(total_iv) or np.isnan(total_iv):
+        return None, None, None
+    
+    # Create mapping
+    mapping = dict(zip(grouped[col], grouped['woe']))
+    
+    # Clean output
+    grouped = grouped.rename(columns={col: 'bin'})
+    woe_df = grouped[['bin', 'count', 'events', 'non_events', 'pct_events',
+                       'pct_non_events', 'woe', 'iv']].copy()
+    woe_df['event_rate'] = woe_df['events'] / woe_df['count']
+    woe_df['pct_total'] = woe_df['count'] / len(pdf)
+    
+    return woe_df, total_iv, mapping
+
+
+def _apply_numeric_woe(series, mapping):
+    """Apply WOE mapping to a numeric series."""
+    bins = mapping['bins']
+    woe_values = mapping['woe_values']
+    missing_woe = mapping['missing_woe']
+    
+    # Create bin assignments
+    try:
+        bin_assignments = pd.cut(series, bins=bins, labels=False, include_lowest=True)
+    except Exception:
+        return pd.Series([0] * len(series))
+    
+    # Map bin index to WOE value
+    result = pd.Series(index=series.index, dtype=float)
+    
+    for i, woe in enumerate(woe_values):
+        result[bin_assignments == i] = woe
+    
+    # Handle missing values
+    result[series.isnull()] = missing_woe
+    
+    # Fill any remaining NaN with 0
+    result = result.fillna(0)
+    
+    return result
+
+
+def _is_monotonic(woe_df):
+    """Check if WOE values are monotonically increasing or decreasing."""
+    # Exclude missing bin
+    woe_values = woe_df[woe_df['bin'] != 'Missing']['woe'].values
+    
+    if len(woe_values) <= 1:
+        return True
+    
+    # Check increasing
+    is_increasing = all(woe_values[i] <= woe_values[i+1] for i in range(len(woe_values)-1))
+    # Check decreasing
+    is_decreasing = all(woe_values[i] >= woe_values[i+1] for i in range(len(woe_values)-1))
+    
+    return is_increasing or is_decreasing
+
+
+def _get_predictive_power(iv_value):
+    """Classify IV value into predictive power categories."""
+    if iv_value < 0.02:
+        return "Not Predictive"
+    elif iv_value < 0.1:
+        return "Weak"
+    elif iv_value < 0.3:
+        return "Medium"
+    elif iv_value < 0.5:
+        return "Strong"
+    else:
+        return "Suspicious (Too Good)"
+
+
+# =============================================================================
+# UTILITY FUNCTIONS
+# =============================================================================
+
+def plot_woe(woe_details, variable_name):
+    """
+    Plot WOE values for a specific variable.
+    
+    Parameters:
+    -----------
+    woe_details : dict
+        WOE details dictionary from calculate_woe_iv results
+    variable_name : str
+        Name of the variable to plot
+    """
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("matplotlib is required for plotting. Install with: pip install matplotlib")
+        return
+    
+    if variable_name not in woe_details:
+        print(f"Variable '{variable_name}' not found in WOE details")
+        return
+    
+    df = woe_details[variable_name]
+    
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    
+    # Plot 1: WOE values
+    bins_str = [str(b)[:20] for b in df['bin']]
+    axes[0].bar(range(len(bins_str)), df['woe'], color=['red' if w < 0 else 'green' for w in df['woe']])
+    axes[0].set_xticks(range(len(bins_str)))
+    axes[0].set_xticklabels(bins_str, rotation=45, ha='right', fontsize=8)
+    axes[0].set_title(f'WOE - {variable_name}')
+    axes[0].set_ylabel('WOE')
+    axes[0].axhline(y=0, color='black', linestyle='--', linewidth=0.5)
+    
+    # Plot 2: Event rate and count
+    ax1 = axes[1]
+    ax2 = ax1.twinx()
+    
+    ax1.bar(range(len(bins_str)), df['count'], alpha=0.3, color='blue', label='Count')
+    ax2.plot(range(len(bins_str)), df['event_rate'], 'ro-', label='Event Rate')
+    
+    ax1.set_xticks(range(len(bins_str)))
+    ax1.set_xticklabels(bins_str, rotation=45, ha='right', fontsize=8)
+    ax1.set_title(f'Distribution - {variable_name}')
+    ax1.set_ylabel('Count')
+    ax2.set_ylabel('Event Rate')
+    
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
+    
+    plt.tight_layout()
+    plt.show()
+
+
+def filter_by_iv(results, min_iv=0.02, max_iv=0.5):
+    """
+    Filter variables by IV threshold.
+    
+    Parameters:
+    -----------
+    results : dict
+        Output from calculate_woe_iv
+    min_iv : float
+        Minimum IV threshold (default: 0.02)
+    max_iv : float
+        Maximum IV threshold to exclude suspicious variables (default: 0.5)
+    
+    Returns:
+    --------
+    list of variable names that pass the IV filter
+    """
+    iv_summary = results['iv_summary']
+    filtered = iv_summary[(iv_summary['iv'] >= min_iv) & (iv_summary['iv'] <= max_iv)]
+    return filtered['variable'].tolist()
+
+
+def get_woe_transformed_spark_df(results, sp_df, target_col, selected_vars=None):
+    """
+    Get a Spark DataFrame with only selected WOE-transformed variables.
+    
+    Parameters:
+    -----------
+    results : dict
+        Output from calculate_woe_iv
+    sp_df : pyspark.sql.DataFrame
+        Original Spark DataFrame
+    target_col : str
+        Target column name
+    selected_vars : list
+        List of variables to include (if None, uses all with IV > 0.02)
+    
+    Returns:
+    --------
+    pyspark.sql.DataFrame with WOE-transformed selected variables
+    """
+    if selected_vars is None:
+        selected_vars = filter_by_iv(results)
+    
+    woe_cols = [var + '_woe' for var in selected_vars]
+    available_cols = [col for col in [target_col] + woe_cols 
+                      if col in results['transformed_df'].columns]
+    
+    return results['transformed_df'].select(available_cols)
+
+
+# =============================================================================
+# EXAMPLE USAGE
+# =============================================================================
+
+def example_usage():
+    """
+    Example of how to use the calculate_woe_iv function.
+    """
+    example_code = """
+    # =========================================================================
+    # Example Usage with Snowflake Spark DataFrame
+    # =========================================================================
+    
+    from pyspark.sql import SparkSession
+    
+    # Initialize Spark session (typically already available in Snowflake/Databricks)
+    spark = SparkSession.builder.getOrCreate()
+    
+    # Read data from Snowflake
+    sp_df = spark.read.format("snowflake") \\
+        .options(**snowflake_options) \\
+        .option("query", "SELECT * FROM my_database.my_schema.my_table") \\
+        .load()
+    
+    # OR if you already have a Snowpark DataFrame, convert to Spark:
+    # sp_df = snowpark_df.to_spark()
+    
+    # =========================================================================
+    # Run WOE/IV Calculation
+    # =========================================================================
+    
+    results = calculate_woe_iv(
+        sp_df=sp_df,
+        target_col='default_flag',        # Your binary target (0/1)
+        max_bins=10,                       # Maximum bins for numeric variables
+        min_pct=0.05,                      # Minimum 5% records per bin
+        cardinality_threshold=50,          # Remove categoricals with >50 unique values
+        date_keywords=None,                # Uses default date keywords
+        id_keywords=None                   # Uses default ID keywords
+    )
+
+    # =========================================================================
+    # Access Results
+    # =========================================================================
+
+    # 1. IV Summary - ranked table of all variables with their IV values
+    iv_summary = results['iv_summary']
+    print("\n===== IV SUMMARY =====")
+    print(iv_summary.to_string(index=False))
+
+    # 2. WOE Details - detailed WOE table for each variable
+    woe_details = results['woe_details']
+    
+    # View WOE details for a specific variable
+    for var_name, woe_table in woe_details.items():
+        print(f"\n===== WOE Details: {var_name} =====")
+        print(woe_table.to_string(index=False))
+
+    # 3. Removed Columns - columns that were filtered out with reasons
+    removed_cols = results['removed_columns']
+    print("\n===== REMOVED COLUMNS =====")
+    print(removed_cols.to_string(index=False))
+
+    # 4. WOE-Transformed Spark DataFrame (ready for modeling)
+    transformed_df = results['transformed_df']
+    transformed_df.show(10)
+
+    # 5. WOE Mappings - raw mappings for applying to new data
+    woe_mappings = results['woe_mappings']
+
+    # =========================================================================
+    # Filter Variables by IV Threshold
+    # =========================================================================
+
+    # Get variables with meaningful predictive power (IV between 0.02 and 0.5)
+    selected_vars = filter_by_iv(results, min_iv=0.02, max_iv=0.5)
+    print(f"\nSelected variables (0.02 <= IV <= 0.5): {len(selected_vars)}")
+    print(selected_vars)
+
+    # Get only strong predictors
+    strong_vars = filter_by_iv(results, min_iv=0.1, max_iv=0.5)
+    print(f"\nStrong variables (0.1 <= IV <= 0.5): {len(strong_vars)}")
+    print(strong_vars)
+
+    # =========================================================================
+    # Get Filtered WOE-Transformed Spark DataFrame for Modeling
+    # =========================================================================
+
+    # Only keep selected variables in the transformed DataFrame
+    model_ready_df = get_woe_transformed_spark_df(
+        results=results,
+        sp_df=sp_df,
+        target_col='default_flag',
+        selected_vars=selected_vars  # or strong_vars for fewer features
+    )
+    
+    print("\nModel-ready DataFrame schema:")
+    model_ready_df.printSchema()
+    model_ready_df.show(5)
+
+    # =========================================================================
+    # Plotting (if matplotlib is available)
+    # =========================================================================
+
+    # Plot IV summary chart
+    plot_iv_summary(results, top_n=15)
+
+    # Plot WOE for individual variables
+    if selected_vars:
+        # Plot top 3 variables by IV
+        top_3_vars = iv_summary.head(3)['variable'].tolist()
+        for var in top_3_vars:
+            plot_woe(woe_details, var)
+
+    # =========================================================================
+    # Export Results (Optional)
+    # =========================================================================
+
+    # Save IV summary to CSV
+    iv_summary.to_csv('/tmp/iv_summary.csv', index=False)
+
+    # Save WOE details to Excel (one sheet per variable)
+    try:
+        with pd.ExcelWriter('/tmp/woe_details.xlsx') as writer:
+            iv_summary.to_excel(writer, sheet_name='IV_Summary', index=False)
+            removed_cols.to_excel(writer, sheet_name='Removed_Columns', index=False)
+            for var_name, woe_table in woe_details.items():
+                # Excel sheet names max 31 chars
+                sheet_name = var_name[:31]
+                woe_table.to_excel(writer, sheet_name=sheet_name, index=False)
+        print("\nWOE details exported to /tmp/woe_details.xlsx")
+    except Exception as e:
+        print(f"Could not export to Excel: {e}")
+
+    # =========================================================================
+    # Write Transformed DataFrame Back to Snowflake (Optional)
+    # =========================================================================
+
+    # Option 1: Write using Spark Snowflake connector
+    # model_ready_df.write \
+    #     .format("snowflake") \
+    #     .options(**snowflake_options) \
+    #     .option("dbtable", "MY_SCHEMA.WOE_TRANSFORMED_TABLE") \
+    #     .mode("overwrite") \
+    #     .save()
+
+    # Option 2: If using Snowpark, convert back
+    # snowpark_df = session.create_dataframe(model_ready_df.toPandas())
+    # snowpark_df.write.save_as_table("WOE_TRANSFORMED_TABLE", mode="overwrite")
+
+    # =========================================================================
+    # Apply WOE to New/Scoring Data
+    # =========================================================================
+
+    def apply_woe_to_new_data(new_sp_df, woe_mappings, selected_vars):
+        """
+        Apply pre-computed WOE mappings to new/scoring data.
+        
+        Parameters:
+        -----------
+        new_sp_df : pyspark.sql.DataFrame
+            New Spark DataFrame to transform
+        woe_mappings : dict
+            WOE mappings from calculate_woe_iv results
+        selected_vars : list
+            List of variables to transform
+            
+        Returns:
+        --------
+        pandas.DataFrame with WOE-transformed variables
+        """
+        new_pdf = new_sp_df.toPandas()
+        woe_transformed = pd.DataFrame(index=new_pdf.index)
+
+        for col in selected_vars:
+            if col not in woe_mappings:
+                print(f"  Warning: {col} not found in WOE mappings, skipping.")
+                continue
+
+            mapping = woe_mappings[col]
+
+            if isinstance(mapping, dict) and 'bins' in mapping:
+                # Numeric variable
+                woe_transformed[col + '_woe'] = _apply_numeric_woe(new_pdf[col], mapping)
+            else:
+                # Categorical variable
+                woe_transformed[col + '_woe'] = (
+                    new_pdf[col].fillna('__MISSING__').map(mapping).fillna(0)
+                )
+
+        return woe_transformed
+
+    # Example: Apply to scoring data
+    # scoring_df = spark.read.format("snowflake") \
+    #     .options(**snowflake_options) \
+    #     .option("query", "SELECT * FROM scoring_table") \
+    #     .load()
+    #
+    # scored_woe = apply_woe_to_new_data(scoring_df, woe_mappings, selected_vars)
+    # print(scored_woe.head())
+
+    # =========================================================================
+    # Quick Model Validation (Optional - Logistic Regression with WOE vars)
+    # =========================================================================
+
+    def quick_logistic_validation(results, target_col, selected_vars):
+        """
+        Quick logistic regression to validate WOE transformation.
+        """
+        try:
+            from sklearn.linear_model import LogisticRegression
+            from sklearn.model_selection import cross_val_score
+            from sklearn.metrics import roc_auc_score
+        except ImportError:
+            print("scikit-learn required for validation. pip install scikit-learn")
+            return
+
+        # Get transformed data as pandas
+        transformed_pdf = results['transformed_df'].toPandas()
+
+        woe_cols = [var + '_woe' for var in selected_vars
+                    if var + '_woe' in transformed_pdf.columns]
+
+        if not woe_cols:
+            print("No WOE columns available for validation.")
+            return
+
+        X = transformed_pdf[woe_cols].fillna(0)
+        y = transformed_pdf[target_col]
+
+        # Fit logistic regression
+        lr = LogisticRegression(random_state=42, max_iter=1000)
+
+        # Cross-validated AUC
+        cv_scores = cross_val_score(lr, X, y, cv=5, scoring='roc_auc')
+
+        print("\n===== QUICK LOGISTIC REGRESSION VALIDATION =====")
+        print(f"Number of WOE features: {len(woe_cols)}")
+        print(f"5-Fold CV AUC scores: {cv_scores.round(4)}")
+        print(f"Mean AUC: {cv_scores.mean():.4f} (+/- {cv_scores.std():.4f})")
+
+        # Fit on full data for feature importance
+        lr.fit(X, y)
+        coef_df = pd.DataFrame({
+            'variable': woe_cols,
+            'coefficient': lr.coef_[0]
+        }).sort_values('coefficient', key=abs, ascending=False)
+
+        print("\nFeature Coefficients:")
+        print(coef_df.to_string(index=False))
+
+        return cv_scores
+
+    # Run quick validation
+    # quick_logistic_validation(results, 'default_flag', selected_vars)
+
+
+# =============================================================================
+# COMPLETE EXAMPLE - Copy-paste ready
+# =============================================================================
+
+if __name__ == "__main__":
+    """
+    Full end-to-end example.
+    Replace connection details and table names with your own.
+    """
+
+    from pyspark.sql import SparkSession
+
+    # Initialize Spark
+    spark = SparkSession.builder \
+        .appName("WOE_IV_Calculator") \
+        .getOrCreate()
+
+    # Snowflake connection options
+    snowflake_options = {
+        "sfURL": "your_account.snowflakecomputing.com",
+        "sfUser": "your_username",
+        "sfPassword": "your_password",
+        "sfDatabase": "your_database",
+        "sfSchema": "your_schema",
+        "sfWarehouse": "your_warehouse",
+        "sfRole": "your_role"
+    }
+
+    # Read from Snowflake
+    sp_df = spark.read.format("snowflake") \
+        .options(**snowflake_options) \
+        .option("query", """
+            SELECT * 
+            FROM your_database.your_schema.your_table
+            WHERE some_filter = 'value'
+        """) \
+        .load()
+
+    # Run the WOE/IV calculation
+    results = calculate_woe_iv(
+        sp_df=sp_df,
+        target_col='default_flag',
+        max_bins=10,
+        min_pct=0.05,
+        cardinality_threshold=50
+    )
+
+    # Get selected variables
+    selected_vars = filter_by_iv(results, min_iv=0.02, max_iv=0.5)
+
+    # Get model-ready DataFrame
+    model_df = get_woe_transformed_spark_df(results, sp_df, 'default_flag', selected_vars)
+
+    # Show results
+    print(f"\nFinal model-ready features: {len(selected_vars)}")
+    model_df.show(10)
+
+    print("\nDone!")
+
+# =============================================================================
+# HOW TO CALL THE FUNCTION - Multiple Examples
+# =============================================================================
+
+# =============================================================================
+# EXAMPLE 1: Basic Call (Minimum Required Parameters)
+# =============================================================================
+
+from pyspark.sql import SparkSession
+
+# Get or create Spark session
+spark = SparkSession.builder.appName("WOE_IV").getOrCreate()
+
+# Assume sp_df is your Snowflake Spark DataFrame already loaded
+# sp_df = spark.read.format("snowflake").options(**sf_options).option("dbtable", "MY_TABLE").load()
+
+# Simplest call - just pass DataFrame and target column
+results = calculate_woe_iv(
+    sp_df=sp_df,
+    target_col='default_flag'
+)
+
+# =============================================================================
+# EXAMPLE 2: Full Call with All Parameters
+# =============================================================================
+
+results = calculate_woe_iv(
+    sp_df=sp_df,
+    target_col='default_flag',
+    max_bins=10,
+    min_pct=0.05,
+    cardinality_threshold=50,
+    date_keywords=['date', 'dt', 'time', 'timestamp', 'created', 'dob'],
+    id_keywords=['id', 'key', 'uuid', 'ssn', 'phone', 'email', 'account_no']
+)
+
+# =============================================================================
+# EXAMPLE 3: Reading from Snowflake and Calling
+# =============================================================================
+
+# Snowflake connection
+snowflake_options = {
+    "sfURL": "myaccount.snowflakecomputing.com",
+    "sfUser": "my_user",
+    "sfPassword": "my_password",
+    "sfDatabase": "MY_DB",
+    "sfSchema": "MY_SCHEMA",
+    "sfWarehouse": "MY_WH",
+    "sfRole": "MY_ROLE"
+}
+
+# Read data
+sp_df = spark.read.format("snowflake") \
+    .options(**snowflake_options) \
+    .option("query", "SELECT * FROM MY_DB.MY_SCHEMA.CREDIT_DATA") \
+    .load()
+
+# Call the function
+results = calculate_woe_iv(
+    sp_df=sp_df,
+    target_col='IS_DEFAULT'
+)
+
+# =============================================================================
+# EXAMPLE 4: Using with Snowpark DataFrame (convert to Spark first)
+# =============================================================================
+
+# If you have a Snowpark session and DataFrame:
+# from snowflake.snowpark import Session
+# 
+# session = Session.builder.configs(connection_params).create()
+# snowpark_df = session.table("MY_TABLE")
+# 
+# # Convert Snowpark to Spark DataFrame
+# sp_df = snowpark_df.to_spark()
+# 
+# # Then call normally
+# results = calculate_woe_iv(sp_df=sp_df, target_col='target')
+
+# =============================================================================
+# EXAMPLE 5: Access Results After Calling
+# =============================================================================
+
+results = calculate_woe_iv(sp_df=sp_df, target_col='default_flag', max_bins=8)
+
+# --- Access IV Summary ---
+print(results['iv_summary'])
+# Output: DataFrame with columns [variable, iv, predictive_power, rank]
+
+# --- Access WOE Details for a specific variable ---
+print(results['woe_details']['income'])
+# Output: DataFrame with columns [bin, count, events, non_events, woe, iv, event_rate]
+
+# --- Access Removed Columns ---
+print(results['removed_columns'])
+# Output: DataFrame with columns [column, reason]
+
+# --- Access Transformed Spark DataFrame ---
+results['transformed_df'].show(5)
+# Output: Spark DataFrame with target + all _woe columns
+
+# --- Access WOE Mappings (for scoring new data) ---
+print(results['woe_mappings']['income'])
+# Output: dict with bins, woe_values, missing_woe
+
+# =============================================================================
+# EXAMPLE 6: Full Pipeline - Call + Filter + Model
+# =============================================================================
+
+# Step 1: Calculate WOE/IV
+results = calculate_woe_iv(
+    sp_df=sp_df,
+    target_col='default_flag',
+    max_bins=10,
+    min_pct=0.05,
+    cardinality_threshold=50
+)
+
+# Step 2: Filter variables by IV
+selected_vars = filter_by_iv(results, min_iv=0.02, max_iv=0.5)
+print(f"Selected {len(selected_vars)} variables: {selected_vars}")
+
+# Step 3: Get model-ready DataFrame
+model_df = get_woe_transformed_spark_df(
+    results=results,
+    sp_df=sp_df,
+    target_col='default_flag',
+    selected_vars=selected_vars
+)
+
+# Step 4: Use for modeling (convert to pandas for sklearn)
+model_pdf = model_df.toPandas()
+
+X = model_pdf.drop('default_flag', axis=1)
+y = model_pdf['default_flag']
+
+# Fit model
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42)
+
+model = LogisticRegression(max_iter=1000)
+model.fit(X_train, y_train)
+
+y_pred_proba = model.predict_proba(X_test)[:, 1]
+auc = roc_auc_score(y_test, y_pred_proba)
+print(f"Test AUC: {auc:.4f}")
+
+# =============================================================================
+# EXAMPLE 7: Plot Results
+# =============================================================================
+
+# Plot IV summary (top 15 variables)
+plot_iv_summary(results, top_n=15)
+
+# Plot WOE for a specific variable
+plot_woe(results['woe_details'], 'income')
+plot_woe(results['woe_details'], 'age')
+plot_woe(results['woe_details'], 'loan_amount')
+
+# =============================================================================
+# EXAMPLE 8: Apply WOE to New Scoring Data
+# =============================================================================
+
+# Load new data
+new_sp_df = spark.read.format("snowflake") \
+    .options(**snowflake_options) \
+    .option("query", "SELECT * FROM MY_DB.MY_SCHEMA.NEW_APPLICATIONS") \
+    .load()
+
+new_pdf = new_sp_df.toPandas()
+woe_mappings = results['woe_mappings']
+
+# Apply WOE transformation to new data
+scored_df = pd.DataFrame(index=new_pdf.index)
+
+for col in selected_vars:
+    if col in woe_mappings:
+        mapping = woe_mappings[col]
+        if isinstance(mapping, dict) and 'bins' in mapping:
+            # Numeric
+            scored_df[col + '_woe'] = _apply_numeric_woe(new_pdf[col], mapping)
+        else:
+            # Categorical
+            scored_df[col + '_woe'] = new_pdf[col].fillna('__MISSING__').map(mapping).fillna(0)
+
+# Score with trained model
+scores = model.predict_proba(scored_df)[:, 1]
+new_pdf['predicted_probability'] = scores
+print(new_pdf[['predicted_probability']].describe())
+
+# =============================================================================
+# QUICK REFERENCE - Function Signatures
+# =============================================================================
+
+"""
+MAIN FUNCTION:
+--------------
+results = calculate_woe_iv(
+    sp_df,                          # Required: Spark DataFrame
+    target_col,                     # Required: binary target column name (0/1)
+    max_bins=20,                    # Optional: max bins for numerics
+    min_pct=0.05,                   # Optional: min % records per bin
+    cardinality_threshold=50,       # Optional: max unique values for categoricals
+    date_keywords=None,             # Optional: list of date-related keywords
+    id_keywords=None                # Optional: list of ID-related keywords
+)
+
+RETURNS dict with:
+    results['iv_summary']       -> pd.DataFrame (variable, iv, predictive_power, rank)
+    results['woe_details']      -> dict of pd.DataFrames per variable
+    results['removed_columns']  -> pd.DataFrame (column, reason)
+    results['transformed_df']   -> Spark DataFrame with WOE columns
+    results['woe_mappings']     -> dict of mappings per variable
+
+HELPER FUNCTIONS:
+-----------------
+selected_vars = filter_by_iv(results, min_iv=0.02, max_iv=0.5)
+model_df = get_woe_transformed_spark_df(results, sp_df, target_col, selected_vars)
+plot_woe(results['woe_details'], 'variable_name')
+plot_iv_summary(results, top_n=20)
+"""
