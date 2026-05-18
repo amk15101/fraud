@@ -428,6 +428,11 @@ def apply_rules_to_dataframe_snowpark(
 # NO RANGES, NO BETWEEN
 # =============================================================================
 
+# =============================================================================
+# FUNCTION 3: NUMERIC THRESHOLD RULES (SNOWPARK) - WITH 4 & 5 VARIABLE RULES
+# ONLY: var > X  or  var <= X  (NO RANGES / NO BETWEEN)
+# =============================================================================
+
 def generate_numeric_threshold_rules_snowpark(
     sp_df: DataFrame,
     target_flag: str = "FRAUD_TRANS",
@@ -435,14 +440,18 @@ def generate_numeric_threshold_rules_snowpark(
     min_hit_rate: float = 0.10,
     min_support: int = 100,
     exclude_patterns: Optional[List[str]] = None,
-    percentile_thresholds: List[float] = None
+    percentile_thresholds: List[float] = None,
+    max_variable_depth: int = 5  # NEW: controls max variables in a rule
 ):
     """
-    Generate numeric threshold rules.
+    Generate numeric threshold rules with up to 5 variables.
     ONLY creates rules in format:
         variable > threshold
         variable <= threshold
     NEVER creates range/between rules.
+    
+    Builds rules iteratively:
+        1-var → 2-var → 3-var → 4-var → 5-var
     """
     if exclude_patterns is None:
         exclude_patterns = [
@@ -461,6 +470,7 @@ def generate_numeric_threshold_rules_snowpark(
 
     print("=" * 80)
     print("NUMERIC THRESHOLD RULE GENERATION (SNOWPARK)")
+    print(f"MAX VARIABLE DEPTH: {max_variable_depth}")
     print("RULE FORMAT: var > X  or  var <= X  (NO RANGES / NO BETWEEN)")
     print("=" * 80)
 
@@ -478,7 +488,7 @@ def generate_numeric_threshold_rules_snowpark(
                 return True
         return False
 
-    # Get numeric columns from schema
+    # Get numeric columns
     schema = sp_df.schema
     numeric_snowpark_types = (
         'LongType', 'IntegerType', 'FloatType', 'DoubleType', 'DecimalType'
@@ -493,294 +503,338 @@ def generate_numeric_threshold_rules_snowpark(
     print(f"\n  Numeric columns to analyze: {len(numeric_columns)}")
     print(f"  Columns: {numeric_columns}")
 
-    threshold_rules = []
+    # =========================================================================
+    # HELPER: Build Snowpark condition from rule description string
+    # Parses: "var1 > X AND var2 <= Y AND var3 > Z"
+    # =========================================================================
+    def build_condition_from_description(rule_desc: str):
+        """Parse rule description and return Snowpark filter condition."""
+        parts = rule_desc.split(' AND ')
+        condition = None
+        for part in parts:
+            part = part.strip()
+            if ' > ' in part:
+                col_part, val_part = part.split(' > ', 1)
+                cond = F.col(col_part.strip()) > F.lit(float(val_part.strip()))
+            elif ' <= ' in part:
+                col_part, val_part = part.split(' <= ', 1)
+                cond = F.col(col_part.strip()) <= F.lit(float(val_part.strip()))
+            else:
+                continue
+            condition = cond if condition is None else (condition & cond)
+        return condition
+
+    # =========================================================================
+    # HELPER: Get columns used in a rule description
+    # =========================================================================
+    def get_columns_from_description(rule_desc: str) -> set:
+        """Extract column names from rule description."""
+        parts = rule_desc.split(' AND ')
+        cols = set()
+        for part in parts:
+            part = part.strip()
+            if ' > ' in part:
+                col_part = part.split(' > ', 1)[0].strip()
+                cols.add(col_part)
+            elif ' <= ' in part:
+                col_part = part.split(' <= ', 1)[0].strip()
+                cols.add(col_part)
+        return cols
+
+    # =========================================================================
+    # HELPER: Test a rule and return stats if it qualifies
+    # =========================================================================
+    def test_rule(rule_desc: str, min_obs: int = 100):
+        """Test a rule against the data. Returns dict if qualifies, None otherwise."""
+        condition = build_condition_from_description(rule_desc)
+        if condition is None:
+            return None
+
+        try:
+            stats = sp_df.filter(condition).agg(
+                F.count("*").alias("TOTAL_COUNT"),
+                F.sum(F.col(target_flag).cast(IntegerType())).alias("FRAUD_COUNT"),
+                F.sum(
+                    F.when(F.col(target_flag) == 1, F.col(target_amt)).otherwise(F.lit(0))
+                ).alias("FRAUD_AMOUNT_SUM")
+            ).collect()[0]
+
+            count = stats['TOTAL_COUNT']
+            fraud = stats['FRAUD_COUNT'] or 0
+            fraud_amt = stats['FRAUD_AMOUNT_SUM'] or 0
+
+            if count >= min_obs and count > 0:
+                hit_rate = fraud / count
+                if hit_rate >= min_hit_rate:
+                    return {
+                        'total_records': count,
+                        'fraud_count': fraud,
+                        'hit_rate': hit_rate,
+                        'fraud_amount_sum': fraud_amt,
+                        'avg_fraud_amount': fraud_amt / fraud if fraud > 0 else 0,
+                        'lift': hit_rate / overall_fraud_rate if overall_fraud_rate > 0 else 0,
+                        'fraud_capture_rate': fraud / total_fraud if total_fraud > 0 else 0
+                    }
+        except Exception:
+            pass
+        return None
+
+    # =========================================================================
+    # PRE-COMPUTE: Get percentiles for all numeric columns
+    # =========================================================================
+    print("\n  Pre-computing percentiles for all numeric columns...")
+    column_percentiles = {}
 
     for col in numeric_columns:
-        print(f"\n  Processing: {col}")
         try:
-            # Get percentiles using APPROX_PERCENTILE
-            select_exprs = []
-            for i, pct in enumerate(percentile_thresholds):
-                select_exprs.append(
-                    F.call_function("APPROX_PERCENTILE", F.col(col), F.lit(pct)).alias(f"P{i}")
-                )
-
+            select_exprs = [
+                F.call_function("APPROX_PERCENTILE", F.col(col), F.lit(pct)).alias(f"P{i}")
+                for i, pct in enumerate(percentile_thresholds)
+            ]
             percentile_row = sp_df.select(*select_exprs).collect()
 
-            if not percentile_row:
-                continue
+            if percentile_row:
+                row_data = percentile_row[0]
+                values = []
+                for i in range(len(percentile_thresholds)):
+                    val = row_data[f"P{i}"]
+                    values.append(float(val) if val is not None else 0.0)
 
-            row_data = percentile_row[0]
-            percentile_values = []
-            for i in range(len(percentile_thresholds)):
-                val = row_data[f"P{i}"]
-                percentile_values.append(float(val) if val is not None else 0.0)
-
-            # Remove duplicate thresholds
-            seen = set()
-            unique_thresholds = []
-            for pct, val in zip(percentile_thresholds, percentile_values):
-                if val not in seen:
-                    seen.add(val)
-                    unique_thresholds.append((pct, val))
-
-            for pct, threshold in unique_thresholds:
-
-                # ============================================
-                # RULE TYPE 1: variable > threshold
-                # ============================================
-                above_stats = sp_df.filter(F.col(col) > F.lit(threshold)).agg(
-                    F.count("*").alias("TOTAL_COUNT"),
-                    F.sum(F.col(target_flag).cast(IntegerType())).alias("FRAUD_COUNT"),
-                    F.sum(
-                        F.when(F.col(target_flag) == 1, F.col(target_amt)).otherwise(F.lit(0))
-                    ).alias("FRAUD_AMOUNT_SUM")
-                ).collect()[0]
-
-                count_above = above_stats['TOTAL_COUNT']
-                fraud_above = above_stats['FRAUD_COUNT'] or 0
-                fraud_amt_above = above_stats['FRAUD_AMOUNT_SUM'] or 0
-
-                if count_above >= min_support and count_above > 0:
-                    hit_rate_above = fraud_above / count_above
-                    if hit_rate_above >= min_hit_rate:
-                        threshold_rules.append({
-                            'rule_description': f"{col} > {threshold:.4f}",
-                            'rule_columns': col,
-                            'rule_type': 'greater_than',
-                            'threshold_value': threshold,
-                            'percentile': pct,
-                            'combination_depth': 1,
-                            'total_records': count_above,
-                            'fraud_count': fraud_above,
-                            'hit_rate': hit_rate_above,
-                            'fraud_amount_sum': fraud_amt_above,
-                            'avg_fraud_amount': fraud_amt_above / fraud_above if fraud_above > 0 else 0,
-                            'lift': hit_rate_above / overall_fraud_rate if overall_fraud_rate > 0 else 0,
-                            'fraud_capture_rate': fraud_above / total_fraud if total_fraud > 0 else 0
-                        })
-
-                # ============================================
-                # RULE TYPE 2: variable <= threshold
-                # ============================================
-                below_stats = sp_df.filter(F.col(col) <= F.lit(threshold)).agg(
-                    F.count("*").alias("TOTAL_COUNT"),
-                    F.sum(F.col(target_flag).cast(IntegerType())).alias("FRAUD_COUNT"),
-                    F.sum(
-                        F.when(F.col(target_flag) == 1, F.col(target_amt)).otherwise(F.lit(0))
-                    ).alias("FRAUD_AMOUNT_SUM")
-                ).collect()[0]
-
-                count_below = below_stats['TOTAL_COUNT']
-                fraud_below = below_stats['FRAUD_COUNT'] or 0
-                fraud_amt_below = below_stats['FRAUD_AMOUNT_SUM'] or 0
-
-                if count_below >= min_support and count_below > 0:
-                    hit_rate_below = fraud_below / count_below
-                    if hit_rate_below >= min_hit_rate:
-                        threshold_rules.append({
-                            'rule_description': f"{col} <= {threshold:.4f}",
-                            'rule_columns': col,
-                            'rule_type': 'less_than_equal',
-                            'threshold_value': threshold,
-                            'percentile': pct,
-                            'combination_depth': 1,
-                            'total_records': count_below,
-                            'fraud_count': fraud_below,
-                            'hit_rate': hit_rate_below,
-                            'fraud_amount_sum': fraud_amt_below,
-                            'avg_fraud_amount': fraud_amt_below / fraud_below if fraud_below > 0 else 0,
-                            'lift': hit_rate_below / overall_fraud_rate if overall_fraud_rate > 0 else 0,
-                            'fraud_capture_rate': fraud_below / total_fraud if total_fraud > 0 else 0
-                        })
-
-            # ============================================
-            # NO RANGE RULES — COMPLETELY REMOVED
-            # ============================================
-
+                # Deduplicate
+                seen = set()
+                unique = []
+                for pct, val in zip(percentile_thresholds, values):
+                    if val not in seen:
+                        seen.add(val)
+                        unique.append((pct, val))
+                column_percentiles[col] = unique
         except Exception as e:
-            print(f"    Warning: Error processing {col}: {str(e)}")
+            print(f"    Warning: Could not get percentiles for {col}: {e}")
             continue
 
-    # ============================================
-    # MULTI-VARIABLE NUMERIC RULES (2-var, 3-var)
-    # Format: var1 > X AND var2 > Y (NO RANGES)
-    # ============================================
+    print(f"  Percentiles computed for {len(column_percentiles)} columns")
 
-    print("\n  Generating multi-variable numeric threshold rules...")
-    print("  Format: var1 > X AND var2 > Y  or  var1 > X AND var2 <= Y")
+    # =========================================================================
+    # PHASE 1: 1-VARIABLE RULES
+    # Format: var > X  or  var <= X
+    # =========================================================================
+    print("\n" + "-" * 60)
+    print("  PHASE 1: Building 1-variable rules...")
+    print("  Format: var > X  or  var <= X")
+    print("-" * 60)
 
-    # Get top single rules as building blocks
-    if threshold_rules:
-        single_rules_sorted = sorted(threshold_rules, key=lambda x: x['hit_rate'], reverse=True)
-        top_single_rules = single_rules_sorted[:15]  # Top 15 single rules
+    all_threshold_rules = []
 
-        # Build 2-variable numeric rules
-        print("\n  Building 2-variable numeric threshold rules...")
-        two_var_numeric_rules = []
+    for col in numeric_columns:
+        if col not in column_percentiles:
+            continue
 
-        for i in range(len(top_single_rules)):
-            for j in range(i + 1, len(top_single_rules)):
-                rule_i = top_single_rules[i]
-                rule_j = top_single_rules[j]
+        for pct, threshold in column_percentiles[col]:
+            # Test: var > threshold
+            rule_desc = f"{col} > {threshold:.4f}"
+            result = test_rule(rule_desc, min_obs=min_support)
+            if result:
+                all_threshold_rules.append({
+                    'rule_description': rule_desc,
+                    'rule_columns': col,
+                    'rule_type': 'greater_than',
+                    'threshold_value': threshold,
+                    'percentile': pct,
+                    'combination_depth': 1,
+                    **result
+                })
+
+            # Test: var <= threshold
+            rule_desc = f"{col} <= {threshold:.4f}"
+            result = test_rule(rule_desc, min_obs=min_support)
+            if result:
+                all_threshold_rules.append({
+                    'rule_description': rule_desc,
+                    'rule_columns': col,
+                    'rule_type': 'less_than_equal',
+                    'threshold_value': threshold,
+                    'percentile': pct,
+                    'combination_depth': 1,
+                    **result
+                })
+
+    print(f"  1-variable rules found: {len(all_threshold_rules)}")
+
+    # =========================================================================
+    # PHASE 2: 2-VARIABLE RULES
+    # Format: var1 > X AND var2 > Y
+    # =========================================================================
+    if max_variable_depth >= 2 and all_threshold_rules:
+        print("\n" + "-" * 60)
+        print("  PHASE 2: Building 2-variable rules...")
+        print("  Format: var1 > X AND var2 <= Y")
+        print("-" * 60)
+
+        # Sort by hit_rate and take top seeds
+        sorted_1var = sorted(all_threshold_rules, key=lambda x: x['hit_rate'], reverse=True)
+        top_1var = sorted_1var[:15]
+
+        two_var_rules = []
+        for i in range(len(top_1var)):
+            for j in range(i + 1, len(top_1var)):
+                rule_i = top_1var[i]
+                rule_j = top_1var[j]
 
                 # Skip if same column
                 if rule_i['rule_columns'] == rule_j['rule_columns']:
                     continue
 
-                col_i = rule_i['rule_columns']
-                col_j = rule_j['rule_columns']
-                thresh_i = rule_i['threshold_value']
-                thresh_j = rule_j['threshold_value']
-                type_i = rule_i['rule_type']
-                type_j = rule_j['rule_type']
+                rule_desc = f"{rule_i['rule_description']} AND {rule_j['rule_description']}"
+                result = test_rule(rule_desc, min_obs=min_support)
+                if result:
+                    cols_used = f"{rule_i['rule_columns']} | {rule_j['rule_columns']}"
+                    two_var_rules.append({
+                        'rule_description': rule_desc,
+                        'rule_columns': cols_used,
+                        'rule_type': 'multi_threshold',
+                        'threshold_value': None,
+                        'percentile': None,
+                        'combination_depth': 2,
+                        **result
+                    })
 
-                # Build conditions — ONLY > or <=
-                if type_i == 'greater_than':
-                    cond_i = F.col(col_i) > F.lit(thresh_i)
-                    desc_i = f"{col_i} > {thresh_i:.4f}"
-                else:
-                    cond_i = F.col(col_i) <= F.lit(thresh_i)
-                    desc_i = f"{col_i} <= {thresh_i:.4f}"
+        all_threshold_rules.extend(two_var_rules)
+        print(f"  2-variable rules found: {len(two_var_rules)}")
 
-                if type_j == 'greater_than':
-                    cond_j = F.col(col_j) > F.lit(thresh_j)
-                    desc_j = f"{col_j} > {thresh_j:.4f}"
-                else:
-                    cond_j = F.col(col_j) <= F.lit(thresh_j)
-                    desc_j = f"{col_j} <= {thresh_j:.4f}"
+    # =========================================================================
+    # PHASE 3: 3-VARIABLE RULES
+    # Format: var1 > X AND var2 <= Y AND var3 > Z
+    # =========================================================================
+    if max_variable_depth >= 3 and two_var_rules:
+        print("\n" + "-" * 60)
+        print("  PHASE 3: Building 3-variable rules...")
+        print("  Format: var1 > X AND var2 <= Y AND var3 > Z")
+        print("-" * 60)
 
-                try:
-                    combo_stats = sp_df.filter(cond_i & cond_j).agg(
-                        F.count("*").alias("TOTAL_COUNT"),
-                        F.sum(F.col(target_flag).cast(IntegerType())).alias("FRAUD_COUNT"),
-                        F.sum(
-                            F.when(F.col(target_flag) == 1, F.col(target_amt)).otherwise(F.lit(0))
-                        ).alias("FRAUD_AMOUNT_SUM")
-                    ).collect()[0]
+        # Take top 2-var rules as seeds
+        sorted_2var = sorted(two_var_rules,
+                             key=lambda x: x['hit_rate'] * x['fraud_capture_rate'],
+                             reverse=True)
+        top_2var = sorted_2var[:10]
 
-                    count_combo = combo_stats['TOTAL_COUNT']
-                    fraud_combo = combo_stats['FRAUD_COUNT'] or 0
-                    fraud_amt_combo = combo_stats['FRAUD_AMOUNT_SUM'] or 0
+        three_var_rules = []
+        for combo_rule in top_2var:
+            used_cols = get_columns_from_description(combo_rule['rule_description'])
 
-                    if count_combo >= min_support and count_combo > 0:
-                        hit_rate_combo = fraud_combo / count_combo
-                        if hit_rate_combo >= min_hit_rate:
-                            threshold_rules.append({
-                                'rule_description': f"{desc_i} AND {desc_j}",
-                                'rule_columns': f"{col_i} | {col_j}",
-                                'rule_type': 'multi_threshold',
-                                'threshold_value': f"{thresh_i} | {thresh_j}",
-                                'percentile': None,
-                                'combination_depth': 2,
-                                'total_records': count_combo,
-                                'fraud_count': fraud_combo,
-                                'hit_rate': hit_rate_combo,
-                                'fraud_amount_sum': fraud_amt_combo,
-                                'avg_fraud_amount': fraud_amt_combo / fraud_combo if fraud_combo > 0 else 0,
-                                'lift': hit_rate_combo / overall_fraud_rate if overall_fraud_rate > 0 else 0,
-                                'fraud_capture_rate': fraud_combo / total_fraud if total_fraud > 0 else 0
-                            })
-                            two_var_numeric_rules.append(threshold_rules[-1])
-                except Exception as e:
+            for single_rule in top_1var[:12]:
+                add_col = single_rule['rule_columns']
+                if add_col in used_cols:
                     continue
 
-        print(f"  2-variable numeric rules found: {len(two_var_numeric_rules)}")
+                rule_desc = f"{combo_rule['rule_description']} AND {single_rule['rule_description']}"
+                result = test_rule(rule_desc, min_obs=max(min_support // 2, 50))
+                if result:
+                    all_cols = used_cols | {add_col}
+                    three_var_rules.append({
+                        'rule_description': rule_desc,
+                        'rule_columns': ' | '.join(sorted(all_cols)),
+                        'rule_type': 'multi_threshold',
+                        'threshold_value': None,
+                        'percentile': None,
+                        'combination_depth': 3,
+                        **result
+                    })
 
-        # Build 3-variable numeric rules from top 2-var rules
-        print("\n  Building 3-variable numeric threshold rules...")
-        three_var_numeric_rules = []
+        all_threshold_rules.extend(three_var_rules)
+        print(f"  3-variable rules found: {len(three_var_rules)}")
 
-        if two_var_numeric_rules:
-            top_2var = sorted(two_var_numeric_rules,
-                              key=lambda x: x['hit_rate'] * x['fraud_capture_rate'],
-                              reverse=True)[:10]
+    # =========================================================================
+    # PHASE 4: 4-VARIABLE RULES
+    # Format: var1 > X AND var2 <= Y AND var3 > Z AND var4 > W
+    # =========================================================================
+    if max_variable_depth >= 4 and three_var_rules:
+        print("\n" + "-" * 60)
+        print("  PHASE 4: Building 4-variable rules...")
+        print("  Format: var1 > X AND var2 <= Y AND var3 > Z AND var4 > W")
+        print("-" * 60)
 
-            for combo_rule in top_2var:
-                combo_cols = [c.strip() for c in combo_rule['rule_columns'].split('|')]
+        # Take top 3-var rules as seeds
+        sorted_3var = sorted(three_var_rules,
+                             key=lambda x: x['hit_rate'] * x['fraud_capture_rate'],
+                             reverse=True)
+        top_3var = sorted_3var[:8]
 
-                for single_rule in top_single_rules[:10]:
-                    add_col = single_rule['rule_columns']
+        four_var_rules = []
+        for combo_rule in top_3var:
+            used_cols = get_columns_from_description(combo_rule['rule_description'])
 
-                    # Skip if column already in combo
-                    if add_col in combo_cols:
-                        continue
+            for single_rule in top_1var[:10]:
+                add_col = single_rule['rule_columns']
+                if add_col in used_cols:
+                    continue
 
-                    add_thresh = single_rule['threshold_value']
-                    add_type = single_rule['rule_type']
+                rule_desc = f"{combo_rule['rule_description']} AND {single_rule['rule_description']}"
+                result = test_rule(rule_desc, min_obs=max(min_support // 4, 20))
+                if result:
+                    all_cols = used_cols | {add_col}
+                    four_var_rules.append({
+                        'rule_description': rule_desc,
+                        'rule_columns': ' | '.join(sorted(all_cols)),
+                        'rule_type': 'multi_threshold',
+                        'threshold_value': None,
+                        'percentile': None,
+                        'combination_depth': 4,
+                        **result
+                    })
 
-                    if add_type == 'greater_than':
-                        add_desc = f"{add_col} > {add_thresh:.4f}"
-                        add_cond = F.col(add_col) > F.lit(add_thresh)
-                    else:
-                        add_desc = f"{add_col} <= {add_thresh:.4f}"
-                        add_cond = F.col(add_col) <= F.lit(add_thresh)
+        all_threshold_rules.extend(four_var_rules)
+        print(f"  4-variable rules found: {len(four_var_rules)}")
 
-                    # Rebuild base condition from description
-                    base_parts = combo_rule['rule_description'].split(' AND ')
-                    base_cond = None
-                    for part in base_parts:
-                        part = part.strip()
-                        if ' > ' in part:
-                            pcol, pval = part.split(' > ')
-                            pcond = F.col(pcol.strip()) > F.lit(float(pval.strip()))
-                        elif ' <= ' in part:
-                            pcol, pval = part.split(' <= ')
-                            pcond = F.col(pcol.strip()) <= F.lit(float(pval.strip()))
-                        else:
-                            continue
-                        base_cond = pcond if base_cond is None else (base_cond & pcond)
+    # =========================================================================
+    # PHASE 5: 5-VARIABLE RULES
+    # Format: var1 > X AND var2 <= Y AND var3 > Z AND var4 > W AND var5 <= V
+    # =========================================================================
+    if max_variable_depth >= 5 and four_var_rules:
+        print("\n" + "-" * 60)
+        print("  PHASE 5: Building 5-variable rules...")
+        print("  Format: var1 > X AND var2 <= Y AND var3 > Z AND var4 > W AND var5 <= V")
+        print("-" * 60)
 
-                    if base_cond is None:
-                        continue
+        # Take top 4-var rules as seeds
+        sorted_4var = sorted(four_var_rules,
+                             key=lambda x: x['hit_rate'] * x['fraud_capture_rate'],
+                             reverse=True)
+        top_4var = sorted_4var[:5]
 
-                    full_cond = base_cond & add_cond
-                    full_desc = f"{combo_rule['rule_description']} AND {add_desc}"
+        five_var_rules = []
+        for combo_rule in top_4var:
+            used_cols = get_columns_from_description(combo_rule['rule_description'])
 
-                    try:
-                        stats_3var = sp_df.filter(full_cond).agg(
-                            F.count("*").alias("TOTAL_COUNT"),
-                            F.sum(F.col(target_flag).cast(IntegerType())).alias("FRAUD_COUNT"),
-                            F.sum(
-                                F.when(F.col(target_flag) == 1, F.col(target_amt)).otherwise(F.lit(0))
-                            ).alias("FRAUD_AMOUNT_SUM")
-                        ).collect()[0]
+            for single_rule in top_1var[:8]:
+                add_col = single_rule['rule_columns']
+                if add_col in used_cols:
+                    continue
 
-                        count_3 = stats_3var['TOTAL_COUNT']
-                        fraud_3 = stats_3var['FRAUD_COUNT'] or 0
-                        fraud_amt_3 = stats_3var['FRAUD_AMOUNT_SUM'] or 0
+                rule_desc = f"{combo_rule['rule_description']} AND {single_rule['rule_description']}"
+                result = test_rule(rule_desc, min_obs=max(min_support // 8, 10))
+                if result:
+                    all_cols = used_cols | {add_col}
+                    five_var_rules.append({
+                        'rule_description': rule_desc,
+                        'rule_columns': ' | '.join(sorted(all_cols)),
+                        'rule_type': 'multi_threshold',
+                        'threshold_value': None,
+                        'percentile': None,
+                        'combination_depth': 5,
+                        **result
+                    })
 
-                        if count_3 >= (min_support // 2) and count_3 > 0:
-                            hit_rate_3 = fraud_3 / count_3
-                            if hit_rate_3 >= min_hit_rate:
-                                all_cols = combo_cols + [add_col]
-                                threshold_rules.append({
-                                    'rule_description': full_desc,
-                                    'rule_columns': ' | '.join(all_cols),
-                                    'rule_type': 'multi_threshold',
-                                    'threshold_value': None,
-                                    'percentile': None,
-                                    'combination_depth': 3,
-                                    'total_records': count_3,
-                                    'fraud_count': fraud_3,
-                                    'hit_rate': hit_rate_3,
-                                    'fraud_amount_sum': fraud_amt_3,
-                                    'avg_fraud_amount': fraud_amt_3 / fraud_3 if fraud_3 > 0 else 0,
-                                    'lift': hit_rate_3 / overall_fraud_rate if overall_fraud_rate > 0 else 0,
-                                    'fraud_capture_rate': fraud_3 / total_fraud if total_fraud > 0 else 0
-                                })
-                                three_var_numeric_rules.append(threshold_rules[-1])
-                    except Exception as e:
-                        continue
+        all_threshold_rules.extend(five_var_rules)
+        print(f"  5-variable rules found: {len(five_var_rules)}")
 
-        print(f"  3-variable numeric rules found: {len(three_var_numeric_rules)}")
-
-    # Compile all threshold rules
-    if not threshold_rules:
+    # =========================================================================
+    # COMPILE RESULTS
+    # =========================================================================
+    if not all_threshold_rules:
         print("\n  No threshold rules found meeting criteria!")
         return pd.DataFrame()
 
-    threshold_rules_df = pd.DataFrame(threshold_rules)
+    threshold_rules_df = pd.DataFrame(all_threshold_rules)
     threshold_rules_df = threshold_rules_df.sort_values(
         by=['hit_rate', 'fraud_count'],
         ascending=[False, False]
@@ -799,23 +853,28 @@ def generate_numeric_threshold_rules_snowpark(
     print(f"  1-variable rules: {len(threshold_rules_df[threshold_rules_df['combination_depth'] == 1])}")
     print(f"  2-variable rules: {len(threshold_rules_df[threshold_rules_df['combination_depth'] == 2])}")
     print(f"  3-variable rules: {len(threshold_rules_df[threshold_rules_df['combination_depth'] == 3])}")
+    print(f"  4-variable rules: {len(threshold_rules_df[threshold_rules_df['combination_depth'] == 4])}")
+    print(f"  5-variable rules: {len(threshold_rules_df[threshold_rules_df['combination_depth'] == 5])}")
     print(f"  Max hit rate: {threshold_rules_df['hit_rate'].max():.2%}")
     print(f"  Max lift: {threshold_rules_df['lift'].max():.2f}x")
 
-    print(f"\n  Top 10 Threshold Rules:")
-    print(f"  {'-' * 76}")
-    for _, row in threshold_rules_df.head(10).iterrows():
+    print(f"\n  Top 15 Threshold Rules:")
+    print(f"  {'-' * 80}")
+    for _, row in threshold_rules_df.head(15).iterrows():
         print(f"  #{row['rule_rank']:3d} | Hit Rate: {row['hit_rate_pct']:>7s} | "
               f"Fraud: {row['fraud_count']:>6,} | Records: {row['total_records']:>8,} | "
-              f"Lift: {row['lift']:.1f}x | Depth: {row['combination_depth']}")
-        print(f"       | Rule: {row['rule_description'][:70]}")
-        print(f"  {'-' * 76}")
+              f"Lift: {row['lift']:.1f}x | Vars: {row['combination_depth']}")
+        print(f"       | Rule: {row['rule_description'][:75]}")
+        print(f"  {'-' * 80}")
 
     return threshold_rules_df
 
 
+
+
+
 # =============================================================================
-# FUNCTION 4: COMBINE AND RANK ALL RULES (SNOWPARK)
+# here FUNCTION 4: COMBINE AND RANK ALL RULES (SNOWPARK)
 # NO RANGES — only var > X, var <= X, var = 'value'
 # =============================================================================
 
@@ -1265,13 +1324,15 @@ def run_full_rule_generation_pipeline_snowpark(
     print("PHASE 2: NUMERIC THRESHOLD RULES (var > X or var <= X)")
     print("~" * 80)
 
+    # NEW: Added max_variable_depth=5
     threshold_rules = generate_numeric_threshold_rules_snowpark(
         sp_df=sp_df,
         target_flag=target_flag,
         target_amt=target_amt,
         min_hit_rate=min_hit_rate,
         min_support=min_support,
-        exclude_patterns=exclude_patterns
+        exclude_patterns=exclude_patterns,
+        max_variable_depth=5  # ← ADD THIS LINE
     )
     results['threshold_rules'] = threshold_rules
 
@@ -1551,3 +1612,15 @@ flagged = apply_rules_to_dataframe_snowpark(
     top_n_rules=15
 )
 """
+# =============================================================================
+# CALL IT
+# =============================================================================
+results = run_full_rule_generation_pipeline_snowpark(
+    sp_df=sp_df,
+    target_flag="FRAUD_TRANS",
+    target_amt="FRAUD_AMT",
+    min_hit_rate=0.10,
+    min_support=100,
+    max_combination_depth=3,
+    max_cardinality=50
+)
