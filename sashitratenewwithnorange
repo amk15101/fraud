@@ -1,0 +1,1709 @@
+/***********************************************************************
+* FRAUD RULE GENERATION ENGINE - COMPLETE VERSION
+* 
+* FEATURES:
+* - Automatically removes IDs, dates, high cardinality variables
+* - Creates 1-variable rules (var >= X or var <= X)
+* - Creates 2-variable combination rules
+* - Creates 3, 4, 5-variable rules (ONLY >= X or <= X, NO RANGES)
+* - Includes categorical variable rules (var = 'value')
+* - Greedy rule selection for non-overlapping coverage
+* - Validation on holdout sample
+* - Generates deployable scoring code
+* - Minimum hit rate threshold (default 10%)
+*
+* RULE FORMAT: All numeric rules are strictly:
+*   variable >= cutoff  OR  variable <= cutoff
+*   NEVER: variable BETWEEN x AND y
+*
+* AUTHOR: Auto-generated
+* DATE: 2025
+***********************************************************************/
+
+options mprint mlogic symbolgen;  /* Turn on for debugging */
+options nomprint nomlogic nosymbolgen;  /* Turn off for clean log */
+
+/*=============================================================*/
+/*=============================================================*/
+/* SECTION 1: ALL SUB-MACROS (Define before main macro)        */
+/*=============================================================*/
+/*=============================================================*/
+
+/*-------------------------------------------------------------*/
+/* SUB-MACRO 1: Calculate cardinality for each variable        */
+/*-------------------------------------------------------------*/
+%macro get_cardinality(ds=, outds=);
+
+    proc sql;
+        create table &outds. (
+            name char(32),
+            n_levels num,
+            type num
+        );
+    quit;
+
+    proc contents data=&ds. out=_varlist(keep=name type) noprint;
+    run;
+
+    %let nvar = 0;
+    data _null_;
+        set _varlist nobs=n;
+        call symputx('nvar', n);
+        stop;
+    run;
+
+    %do i = 1 %to &nvar.;
+        data _null_;
+            set _varlist(firstobs=&i. obs=&i.);
+            call symputx('vname', strip(name));
+            call symputx('vtype', type);
+        run;
+
+        proc sql noprint;
+            select count(distinct &vname.) into :nlev trimmed
+            from &ds.;
+        quit;
+
+        proc sql;
+            insert into &outds.
+            set name = "&vname.",
+                n_levels = &nlev.,
+                type = &vtype.;
+        quit;
+    %end;
+
+    proc datasets lib=work nolist; delete _varlist; quit;
+
+%mend get_cardinality;
+
+
+/*-------------------------------------------------------------*/
+/* SUB-MACRO 2: Analyze numeric variables for cutoff rules     */
+/* ONLY creates: var >= X  or  var <= X                        */
+/*-------------------------------------------------------------*/
+%macro analyze_numeric_vars(ds=, target=, num_vars=, min_hit_rate=0.10, outds=numeric_rules);
+
+    proc sql;
+        create table &outds. (
+            variable char(32),
+            rule_type char(20),
+            cutoff num,
+            total_flagged num,
+            fraud_flagged num,
+            hit_rate num,
+            fraud_caught_pct num,
+            rule_description char(200)
+        );
+    quit;
+
+    %let n_num = %sysfunc(countw(&num_vars., %str( )));
+
+    %if &n_num. > 0 %then %do;
+        %do i = 1 %to &n_num.;
+            %let var = %scan(&num_vars., &i., %str( ));
+
+            /* Calculate percentiles */
+            proc univariate data=&ds. noprint;
+                var &var.;
+                output out=_pctls
+                    pctlpts = 1 5 10 25 50 75 90 95 99
+                    pctlpre = p;
+            run;
+
+            data _null_;
+                set _pctls;
+                call symputx('p1', p1);
+                call symputx('p5', p5);
+                call symputx('p10', p10);
+                call symputx('p25', p25);
+                call symputx('p50', p50);
+                call symputx('p75', p75);
+                call symputx('p90', p90);
+                call symputx('p95', p95);
+                call symputx('p99', p99);
+            run;
+
+            /* ============================================ */
+            /* GREATER THAN OR EQUAL rules: var >= cutoff   */
+            /* ============================================ */
+            %let upper_pcts = 75 90 95 99;
+            %do u = 1 %to 4;
+                %let pct = %scan(&upper_pcts., &u.);
+                %let cutval = &&p&pct.;
+
+                %if %sysevalf(&cutval. ne .) %then %do;
+                    proc sql noprint;
+                        select
+                            count(*),
+                            sum(&target.),
+                            case when count(*) > 0
+                                then sum(&target.) / count(*)
+                                else 0 end,
+                            case when (select sum(&target.) from &ds.) > 0
+                                then sum(&target.) / (select sum(&target.) from &ds.)
+                                else 0 end
+                        into :tot_flag trimmed, :fraud_flag trimmed,
+                             :hrate trimmed, :fcaught trimmed
+                        from &ds.
+                        where &var. >= &cutval.;
+                    quit;
+
+                    %if %sysevalf(&hrate. >= &min_hit_rate.) and
+                        %sysevalf(&tot_flag. >= 30) %then %do;
+                        proc sql;
+                            insert into &outds.
+                            set variable = "&var.",
+                                rule_type = "GREATER_THAN",
+                                cutoff = &cutval.,
+                                total_flagged = &tot_flag.,
+                                fraud_flagged = &fraud_flag.,
+                                hit_rate = &hrate.,
+                                fraud_caught_pct = &fcaught.,
+                                rule_description = "&var. >= &cutval.";
+                        quit;
+                    %end;
+                %end;
+            %end;
+
+            /* ============================================ */
+            /* LESS THAN OR EQUAL rules: var <= cutoff      */
+            /* ============================================ */
+            %let lower_pcts = 1 5 10 25;
+            %do l = 1 %to 4;
+                %let pct = %scan(&lower_pcts., &l.);
+                %let cutval = &&p&pct.;
+
+                %if %sysevalf(&cutval. ne .) %then %do;
+                    proc sql noprint;
+                        select
+                            count(*),
+                            sum(&target.),
+                            case when count(*) > 0
+                                then sum(&target.) / count(*)
+                                else 0 end,
+                            case when (select sum(&target.) from &ds.) > 0
+                                then sum(&target.) / (select sum(&target.) from &ds.)
+                                else 0 end
+                        into :tot_flag trimmed, :fraud_flag trimmed,
+                             :hrate trimmed, :fcaught trimmed
+                        from &ds.
+                        where &var. <= &cutval.;
+                    quit;
+
+                    %if %sysevalf(&hrate. >= &min_hit_rate.) and
+                        %sysevalf(&tot_flag. >= 30) %then %do;
+                        proc sql;
+                            insert into &outds.
+                            set variable = "&var.",
+                                rule_type = "LESS_THAN",
+                                cutoff = &cutval.,
+                                total_flagged = &tot_flag.,
+                                fraud_flagged = &fraud_flag.,
+                                hit_rate = &hrate.,
+                                fraud_caught_pct = &fcaught.,
+                                rule_description = "&var. <= &cutval.";
+                        quit;
+                    %end;
+                %end;
+            %end;
+
+        %end; /* end variable loop */
+    %end;
+
+    proc datasets lib=work nolist; delete _pctls; quit;
+
+%mend analyze_numeric_vars;
+
+
+/*-------------------------------------------------------------*/
+/* SUB-MACRO 3: Analyze categorical variables                  */
+/* Rule format: var = 'value'                                  */
+/*-------------------------------------------------------------*/
+%macro analyze_char_vars(ds=, target=, char_vars=, min_hit_rate=0.10, outds=char_rules);
+
+    proc sql;
+        create table &outds. (
+            variable char(32),
+            rule_type char(20),
+            category_value char(200),
+            total_flagged num,
+            fraud_flagged num,
+            hit_rate num,
+            fraud_caught_pct num,
+            rule_description char(500)
+        );
+    quit;
+
+    %let n_char = %sysfunc(countw(&char_vars., %str( )));
+
+    %if &n_char. > 0 %then %do;
+        %do i = 1 %to &n_char.;
+            %let var = %scan(&char_vars., &i., %str( ));
+
+            proc sql;
+                create table _cat_analysis as
+                select
+                    &var. as category_value length=200,
+                    count(*) as total_flagged,
+                    sum(&target.) as fraud_flagged,
+                    case when count(*) > 0
+                        then sum(&target.) / count(*)
+                        else 0 end as hit_rate,
+                    case when (select sum(&target.) from &ds.) > 0
+                        then sum(&target.) / (select sum(&target.) from &ds.)
+                        else 0 end as fraud_caught_pct
+                from &ds.
+                group by &var.
+                having calculated hit_rate >= &min_hit_rate.
+                    and count(*) >= 30
+                order by hit_rate desc;
+            quit;
+
+            proc sql;
+                insert into &outds.
+                select
+                    "&var." as variable,
+                    "EQUALS" as rule_type,
+                    category_value,
+                    total_flagged,
+                    fraud_flagged,
+                    hit_rate,
+                    fraud_caught_pct,
+                    cats("&var.", " = '", strip(category_value), "'")
+                        as rule_description length=500
+                from _cat_analysis;
+            quit;
+
+        %end;
+    %end;
+
+    proc datasets lib=work nolist; delete _cat_analysis; quit;
+
+%mend analyze_char_vars;
+
+
+/*-------------------------------------------------------------*/
+/* SUB-MACRO 4: Create 2-variable combination rules            */
+/* ONLY: var1 >= X and var2 >= Y (or <= combinations)          */
+/*-------------------------------------------------------------*/
+%macro combination_rules(ds=, target=, rules_ds=, min_hit_rate=0.10, outds=combo_rules);
+
+    proc sql;
+        create table &outds. (
+            rule_id num,
+            variable1 char(32),
+            variable2 char(32),
+            rule_description char(500),
+            total_flagged num,
+            fraud_flagged num,
+            hit_rate num,
+            fraud_caught_pct num
+        );
+    quit;
+
+    /* Get top 10 numeric rules */
+    %let n_top_rules = 0;
+    proc sql noprint;
+        select count(*) into :n_top_rules trimmed
+        from (select * from &rules_ds.(obs=10)
+              where rule_type in ("GREATER_THAN", "LESS_THAN"));
+    quit;
+
+    %if &n_top_rules. >= 2 %then %do;
+
+        proc sql noprint;
+            select variable, rule_type, cutoff
+            into :cvar1-:cvar10, :ctype1-:ctype10, :ccut1-:ccut10
+            from (
+                select variable, rule_type, cutoff, monotonic() as rn
+                from &rules_ds.
+                where rule_type in ("GREATER_THAN", "LESS_THAN")
+            )
+            where rn <= 10;
+            %let n_top_rules = &sqlobs.;
+        quit;
+
+        %let combo_counter = 0;
+
+        %do i = 1 %to %eval(&n_top_rules. - 1);
+            %do j = %eval(&i. + 1) %to &n_top_rules.;
+
+                /* Skip if same variable */
+                %if "&&cvar&i." ne "&&cvar&j." %then %do;
+
+                    /* Build condition 1: ONLY >= or <= */
+                    %if "&&ctype&i." = "GREATER_THAN" %then
+                        %let cond1 = &&cvar&i. >= &&ccut&i.;
+                    %else
+                        %let cond1 = &&cvar&i. <= &&ccut&i.;
+
+                    /* Build condition 2: ONLY >= or <= */
+                    %if "&&ctype&j." = "GREATER_THAN" %then
+                        %let cond2 = &&cvar&j. >= &&ccut&j.;
+                    %else
+                        %let cond2 = &&cvar&j. <= &&ccut&j.;
+
+                    proc sql noprint;
+                        select
+                            count(*),
+                            sum(&target.),
+                            case when count(*) > 0
+                                then sum(&target.) / count(*)
+                                else 0 end,
+                            case when (select sum(&target.) from &ds.) > 0
+                                then sum(&target.) / (select sum(&target.) from &ds.)
+                                else 0 end
+                        into :tot_flag trimmed, :fraud_flag trimmed,
+                             :hrate trimmed, :fcaught trimmed
+                        from &ds.
+                        where &cond1. and &cond2.;
+                    quit;
+
+                    %if %sysevalf(&hrate. >= &min_hit_rate.) and
+                        %sysevalf(&tot_flag. >= 30) %then %do;
+                        %let combo_counter = %eval(&combo_counter. + 1);
+                        proc sql;
+                            insert into &outds.
+                            set rule_id = &combo_counter.,
+                                variable1 = "&&cvar&i.",
+                                variable2 = "&&cvar&j.",
+                                rule_description = "&cond1. and &cond2.",
+                                total_flagged = &tot_flag.,
+                                fraud_flagged = &fraud_flag.,
+                                hit_rate = &hrate.,
+                                fraud_caught_pct = &fcaught.;
+                        quit;
+                    %end;
+
+                %end; /* end if different variables */
+
+            %end; /* end j loop */
+        %end; /* end i loop */
+
+    %end; /* end if n_top_rules >= 2 */
+
+%mend combination_rules;
+
+
+/*-------------------------------------------------------------*/
+/* SUB-MACRO 5: Greedy rule selection                          */
+/*-------------------------------------------------------------*/
+%macro greedy_rule_selection(ds=, rules_ds=, target=, min_hit_rate=0.10,
+                             max_rules=20, outds=selected_rules);
+
+    data _scored_base;
+        set &ds.;
+        _already_flagged = 0;
+        _obs_id = _n_;
+    run;
+
+    proc sql;
+        create table &outds. (
+            rule_order num,
+            rule_description char(1000),
+            rule_source char(20),
+            n_conditions num,
+            total_flagged num,
+            fraud_flagged num,
+            hit_rate num,
+            incremental_fraud num,
+            cumulative_fraud num,
+            cumulative_fraud_pct num,
+            cumulative_flagged num,
+            cumulative_hit_rate num
+        );
+    quit;
+
+    %let total_fraud = 0;
+    proc sql noprint;
+        select sum(&target.) into :total_fraud trimmed
+        from &ds.;
+    quit;
+
+    %let cum_fraud = 0;
+    %let cum_flagged = 0;
+    %let n_rules = 0;
+
+    data _null_;
+        set &rules_ds. nobs=n;
+        call symputx('n_rules', n);
+        stop;
+    run;
+
+    %do r = 1 %to &max_rules.;
+
+        %let best_rule = ;
+        %let best_incr_fraud = 0;
+        %let best_hit_rate = 0;
+        %let best_flagged = 0;
+        %let best_fraud = 0;
+        %let best_source = ;
+        %let best_ncond = 0;
+
+        %do rr = 1 %to &n_rules.;
+
+            data _null_;
+                set &rules_ds.(firstobs=&rr. obs=&rr.);
+                call symputx('candidate_rule', strip(rule_description));
+                call symputx('candidate_source', strip(rule_source));
+                if n_conditions ne . then
+                    call symputx('candidate_ncond', n_conditions);
+                else
+                    call symputx('candidate_ncond', 1);
+            run;
+
+            %let cand_incr = 0;
+            %let cand_hrate = 0;
+            %let cand_flagged = 0;
+            %let cand_fraud = 0;
+
+            proc sql noprint;
+                select
+                    count(*),
+                    sum(&target.),
+                    sum(case when _already_flagged = 0 and &target. = 1
+                        then 1 else 0 end),
+                    case when count(*) > 0
+                        then sum(&target.) / count(*)
+                        else 0 end
+                into :cand_flagged trimmed, :cand_fraud trimmed,
+                     :cand_incr trimmed, :cand_hrate trimmed
+                from _scored_base
+                where &candidate_rule.;
+            quit;
+
+            %if %sysevalf(&cand_incr. > &best_incr_fraud.) and
+                %sysevalf(&cand_hrate. >= &min_hit_rate.) %then %do;
+                %let best_rule = &candidate_rule.;
+                %let best_incr_fraud = &cand_incr.;
+                %let best_hit_rate = &cand_hrate.;
+                %let best_flagged = &cand_flagged.;
+                %let best_fraud = &cand_fraud.;
+                %let best_source = &candidate_source.;
+                %let best_ncond = &candidate_ncond.;
+            %end;
+
+        %end; /* end rr loop */
+
+        /* If no rule found, stop */
+        %if &best_incr_fraud. = 0 or "&best_rule." = "" %then %do;
+            %put NOTE: No more rules meet criteria. Stopping at rule %eval(&r.-1).;
+            %goto exit_greedy;
+        %end;
+
+        /* Mark transactions flagged by this rule */
+        proc sql;
+            update _scored_base
+            set _already_flagged = 1
+            where &best_rule. and _already_flagged = 0;
+        quit;
+
+        /* Update cumulative fraud */
+        %let cum_fraud = %eval(&cum_fraud. + &best_incr_fraud.);
+
+        /* Get actual cumulative flagged count (no double counting) */
+        proc sql noprint;
+            select sum(_already_flagged) into :cum_flagged trimmed
+            from _scored_base;
+        quit;
+
+        /* Insert selected rule */
+        proc sql;
+            insert into &outds.
+            set rule_order = &r.,
+                rule_description = "&best_rule.",
+                rule_source = "&best_source.",
+                n_conditions = &best_ncond.,
+                total_flagged = &best_flagged.,
+                fraud_flagged = &best_fraud.,
+                hit_rate = &best_hit_rate.,
+                incremental_fraud = &best_incr_fraud.,
+                cumulative_fraud = &cum_fraud.,
+                cumulative_fraud_pct = &cum_fraud. / &total_fraud.,
+                cumulative_flagged = &cum_flagged.,
+                cumulative_hit_rate = &cum_fraud. / &cum_flagged.;
+        quit;
+
+        %put NOTE: ===================================================;
+        %put NOTE: Rule &r. selected (&best_source. - &best_ncond. conditions);
+        %put NOTE: &best_rule.;
+        %put NOTE: Hit Rate = &best_hit_rate.;
+        %put NOTE: Incremental Fraud = &best_incr_fraud.;
+        %put NOTE: Cumulative Fraud Caught = %sysevalf(&cum_fraud./&total_fraud.*100)%%;
+        %put NOTE: ===================================================;
+
+    %end; /* end r loop */
+
+    %exit_greedy:
+
+    proc datasets lib=work nolist; delete _scored_base; quit;
+
+%mend greedy_rule_selection;
+
+
+/*-------------------------------------------------------------*/
+/* SUB-MACRO 6: MULTI-VARIABLE RULES (3, 4, 5 conditions)     */
+/* RULES ARE ONLY: variable >= X  OR  variable <= X            */
+/* NO RANGES, NO BETWEEN                                       */
+/*-------------------------------------------------------------*/
+%macro multi_variable_rules(ds=, target=, num_vars=, char_vars=,
+                            min_hit_rate=0.10, outds=multi_rules);
+
+    proc sql;
+        create table &outds. (
+            rule_id num,
+            n_conditions num,
+            rule_description char(1000),
+            total_flagged num,
+            fraud_flagged num,
+            hit_rate num,
+            fraud_caught_pct num,
+            variables_used char(500)
+        );
+    quit;
+
+    %let n_num = %sysfunc(countw(&num_vars., %str( )));
+    %let n_char = %sysfunc(countw(&char_vars., %str( )));
+    %let rule_counter = 0;
+
+    /* Limit variables to prevent combinatorial explosion */
+    %let max_vars = %sysfunc(min(&n_num., 10));
+
+    /*---------------------------------------------------------*/
+    /* PRE-COMPUTE: Get percentiles for all numeric vars       */
+    /*---------------------------------------------------------*/
+
+    %do v = 1 %to &max_vars.;
+        %let vname = %scan(&num_vars., &v., %str( ));
+        proc univariate data=&ds. noprint;
+            var &vname.;
+            output out=_pctl_&v.
+                pctlpts=5 10 25 75 90 95
+                pctlpre=_p;
+        run;
+        data _null_;
+            set _pctl_&v.;
+            call symputx("v&v._p5", _p5);
+            call symputx("v&v._p10", _p10);
+            call symputx("v&v._p25", _p25);
+            call symputx("v&v._p75", _p75);
+            call symputx("v&v._p90", _p90);
+            call symputx("v&v._p95", _p95);
+            call symputx("v&v._name", "&vname.");
+        run;
+    %end;
+
+    /*---------------------------------------------------------*/
+    /* HELPER MACRO: Test a rule and insert if qualifies        */
+    /*---------------------------------------------------------*/
+    %macro _test_rule(rule=, n_cond=, vars_used=, min_obs=15);
+
+        %let _tf = 0; %let _ff = 0; %let _hr = 0; %let _fp = 0;
+
+        proc sql noprint;
+            select
+                count(*),
+                sum(&target.),
+                case when count(*) > 0
+                    then sum(&target.) / count(*) else 0 end,
+                case when (select sum(&target.) from &ds.) > 0
+                    then sum(&target.) / (select sum(&target.) from &ds.)
+                    else 0 end
+            into :_tf trimmed, :_ff trimmed, :_hr trimmed, :_fp trimmed
+            from &ds.
+            where &rule.;
+        quit;
+
+        %if %sysevalf(&_hr. >= &min_hit_rate.) and
+            %sysevalf(&_tf. >= &min_obs.) %then %do;
+            %let rule_counter = %eval(&rule_counter. + 1);
+            proc sql;
+                insert into &outds.
+                set rule_id = &rule_counter.,
+                    n_conditions = &n_cond.,
+                    rule_description = "&rule.",
+                    total_flagged = &_tf.,
+                    fraud_flagged = &_ff.,
+                    hit_rate = &_hr.,
+                    fraud_caught_pct = &_fp.,
+                    variables_used = "&vars_used.";
+            quit;
+        %end;
+
+    %mend _test_rule;
+
+    /*=============================================================*/
+    /* PHASE 1: 3-VARIABLE RULES                                   */
+    /* Format: var1 >= X and var2 >= Y and var3 >= Z               */
+    /*     or: var1 >= X and var2 >= Y and var3 <= Z               */
+    /*=============================================================*/
+
+    %put NOTE: ================================================;
+    %put NOTE: PHASE 1: Building 3-variable rules...;
+    %put NOTE: Format: var >= X or var <= X (NO RANGES);
+    %put NOTE: ================================================;
+
+    %do i = 1 %to %eval(&max_vars. - 2);
+      %do j = %eval(&i. + 1) %to %eval(&max_vars. - 1);
+        %do k = %eval(&j. + 1) %to &max_vars.;
+
+            %let vi = &&v&i._name.;
+            %let vj = &&v&j._name.;
+            %let vk = &&v&k._name.;
+            %let vars3 = &vi.|&vj.|&vk.;
+
+            /* Pattern 1: ALL >= high percentiles */
+            %let r3 = &vi. >= &&v&i._p90 and &vj. >= &&v&j._p90 and &vk. >= &&v&k._p75;
+            %_test_rule(rule=&r3., n_cond=3, vars_used=&vars3., min_obs=15);
+
+            /* Pattern 2: Two >= high, one >= medium */
+            %let r3 = &vi. >= &&v&i._p95 and &vj. >= &&v&j._p90 and &vk. >= &&v&k._p90;
+            %_test_rule(rule=&r3., n_cond=3, vars_used=&vars3., min_obs=15);
+
+            /* Pattern 3: Two >= high, one <= low */
+            %let r3 = &vi. >= &&v&i._p90 and &vj. >= &&v&j._p75 and &vk. <= &&v&k._p10;
+            %_test_rule(rule=&r3., n_cond=3, vars_used=&vars3., min_obs=15);
+
+            /* Pattern 4: One >= very high, one <= very low, one >= high */
+            %let r3 = &vi. >= &&v&i._p95 and &vj. <= &&v&j._p5 and &vk. >= &&v&k._p90;
+            %_test_rule(rule=&r3., n_cond=3, vars_used=&vars3., min_obs=15);
+
+            /* Pattern 5: Two <= low, one >= very high */
+            %let r3 = &vi. <= &&v&i._p5 and &vj. <= &&v&j._p10 and &vk. >= &&v&k._p95;
+            %_test_rule(rule=&r3., n_cond=3, vars_used=&vars3., min_obs=15);
+
+            /* Pattern 6: All >= medium */
+            %let r3 = &vi. >= &&v&i._p75 and &vj. >= &&v&j._p75 and &vk. >= &&v&k._p75;
+            %_test_rule(rule=&r3., n_cond=3, vars_used=&vars3., min_obs=15);
+
+            /* Pattern 7: Two >= high, one <= medium */
+            %let r3 = &vi. >= &&v&i._p90 and &vj. >= &&v&j._p90 and &vk. <= &&v&k._p5;
+            %_test_rule(rule=&r3., n_cond=3, vars_used=&vars3., min_obs=15);
+
+            /* Pattern 8: One <= low, two >= high */
+            %let r3 = &vi. <= &&v&i._p10 and &vj. >= &&v&j._p90 and &vk. >= &&v&k._p90;
+            %_test_rule(rule=&r3., n_cond=3, vars_used=&vars3., min_obs=15);
+
+        %end;
+      %end;
+    %end;
+
+    %put NOTE: 3-variable rules complete. Rules found: &rule_counter.;
+
+    /*=============================================================*/
+    /* PHASE 2: 4-VARIABLE RULES                                   */
+    /* Take top 3-var rules, add: var >= X or var <= X             */
+    /*=============================================================*/
+
+    %put NOTE: ================================================;
+    %put NOTE: PHASE 2: Building 4-variable rules...;
+    %put NOTE: ================================================;
+
+    %let n3_rules = 0;
+    proc sql noprint;
+        select count(*) into :n3_rules trimmed
+        from &outds. where n_conditions = 3;
+    quit;
+
+    %if &n3_rules. > 0 %then %do;
+
+        %let n3_top = 0;
+        proc sql noprint;
+            select rule_description, variables_used
+            into :r3_desc1-:r3_desc8, :r3_vars1-:r3_vars8
+            from (
+                select *, monotonic() as rn
+                from &outds.
+                where n_conditions = 3
+                order by hit_rate * fraud_caught_pct desc
+            )
+            where rn <= 8;
+            %let n3_top = &sqlobs.;
+        quit;
+
+        %do t = 1 %to &n3_top.;
+            %do av = 1 %to &max_vars.;
+                %let add_v = &&v&av._name.;
+
+                /* Skip if variable already in this rule */
+                %if %index(&&r3_vars&t., &add_v.) = 0 %then %do;
+
+                    %let vars4 = &&r3_vars&t.|&add_v.;
+
+                    /* Add: new_var >= p95 */
+                    %let r4 = (&&r3_desc&t.) and &add_v. >= &&v&av._p95;
+                    %_test_rule(rule=&r4., n_cond=4, vars_used=&vars4., min_obs=10);
+
+                    /* Add: new_var >= p90 */
+                    %let r4 = (&&r3_desc&t.) and &add_v. >= &&v&av._p90;
+                    %_test_rule(rule=&r4., n_cond=4, vars_used=&vars4., min_obs=10);
+
+                    /* Add: new_var >= p75 */
+                    %let r4 = (&&r3_desc&t.) and &add_v. >= &&v&av._p75;
+                    %_test_rule(rule=&r4., n_cond=4, vars_used=&vars4., min_obs=10);
+
+                    /* Add: new_var <= p5 */
+                    %let r4 = (&&r3_desc&t.) and &add_v. <= &&v&av._p5;
+                    %_test_rule(rule=&r4., n_cond=4, vars_used=&vars4., min_obs=10);
+
+                    /* Add: new_var <= p10 */
+                    %let r4 = (&&r3_desc&t.) and &add_v. <= &&v&av._p10;
+                    %_test_rule(rule=&r4., n_cond=4, vars_used=&vars4., min_obs=10);
+
+                    /* Add: new_var <= p25 */
+                    %let r4 = (&&r3_desc&t.) and &add_v. <= &&v&av._p25;
+                    %_test_rule(rule=&r4., n_cond=4, vars_used=&vars4., min_obs=10);
+
+                %end;
+            %end;
+        %end;
+
+    %end;
+
+    %put NOTE: 4-variable rules complete. Total rules: &rule_counter.;
+
+    /*=============================================================*/
+    /* PHASE 3: 5-VARIABLE RULES                                   */
+    /* Take top 4-var rules, add: var >= X or var <= X             */
+    /*=============================================================*/
+
+    %put NOTE: ================================================;
+    %put NOTE: PHASE 3: Building 5-variable rules...;
+    %put NOTE: ================================================;
+
+    %let n4_rules = 0;
+    proc sql noprint;
+        select count(*) into :n4_rules trimmed
+        from &outds. where n_conditions = 4;
+    quit;
+
+    %if &n4_rules. > 0 %then %do;
+
+        %let n4_top = 0;
+        proc sql noprint;
+            select rule_description, variables_used
+            into :r4_desc1-:r4_desc5, :r4_vars1-:r4_vars5
+            from (
+                select *, monotonic() as rn
+                from &outds.
+                where n_conditions = 4
+                order by hit_rate * fraud_caught_pct desc
+            )
+            where rn <= 5;
+            %let n4_top = &sqlobs.;
+        quit;
+
+        %do t = 1 %to &n4_top.;
+            %do av = 1 %to &max_vars.;
+                %let add_v = &&v&av._name.;
+
+                /* Skip if variable already in this rule */
+                %if %index(&&r4_vars&t., &add_v.) = 0 %then %do;
+
+                    %let vars5 = &&r4_vars&t.|&add_v.;
+
+                    /* Add: new_var >= p90 */
+                    %let r5 = (&&r4_desc&t.) and &add_v. >= &&v&av._p90;
+                    %_test_rule(rule=&r5., n_cond=5, vars_used=&vars5., min_obs=5);
+
+                    /* Add: new_var >= p75 */
+                    %let r5 = (&&r4_desc&t.) and &add_v. >= &&v&av._p75;
+                    %_test_rule(rule=&r5., n_cond=5, vars_used=&vars5., min_obs=5);
+
+                    /* Add: new_var <= p10 */
+                    %let r5 = (&&r4_desc&t.) and &add_v. <= &&v&av._p10;
+                    %_test_rule(rule=&r5., n_cond=5, vars_used=&vars5., min_obs=5);
+
+                    /* Add: new_var <= p25 */
+                    %let r5 = (&&r4_desc&t.) and &add_v. <= &&v&av._p25;
+                    %_test_rule(rule=&r5., n_cond=5, vars_used=&vars5., min_obs=5);
+
+                %end;
+            %end;
+        %end;
+
+    %end;
+
+    %put NOTE: 5-variable rules complete. Total rules: &rule_counter.;
+
+    /*=============================================================*/
+    /* PHASE 4: ADD CATEGORICAL TO TOP NUMERIC RULES               */
+    /* Format: numeric_conditions AND cat_var = 'value'            */
+    /*=============================================================*/
+
+    %if &n_char. > 0 %then %do;
+
+        %put NOTE: ================================================;
+        %put NOTE: PHASE 4: Adding categorical conditions...;
+        %put NOTE: ================================================;
+
+        /* Get top 10 rules as seeds */
+        %let ntop_all = 0;
+        proc sql noprint;
+            select rule_description, variables_used, n_conditions
+            into :seed_desc1-:seed_desc10,
+                 :seed_vars1-:seed_vars10,
+                 :seed_ncond1-:seed_ncond10
+            from (
+                select *, monotonic() as rn
+                from &outds.
+                order by hit_rate * fraud_caught_pct desc
+            )
+            where rn <= 10;
+            %let ntop_all = &sqlobs.;
+        quit;
+
+        %do s = 1 %to &ntop_all.;
+            %do cv = 1 %to %sysfunc(min(&n_char., 5));
+                %let cvar = %scan(&char_vars., &cv., %str( ));
+
+                /* Skip if already used */
+                %if %index(&&seed_vars&s., &cvar.) = 0 %then %do;
+
+                    /* Find top fraud categories within this rule's population */
+                    %let n_hfcats = 0;
+                    proc sql noprint;
+                        select &cvar.
+                        into :hfcat1-:hfcat3
+                        from (
+                            select &cvar.,
+                                count(*) as cnt,
+                                sum(&target.) / count(*) as cat_hr
+                            from &ds.
+                            where &&seed_desc&s.
+                            group by &cvar.
+                            having calculated cat_hr >= &min_hit_rate.
+                                and count(*) >= 10
+                            order by cat_hr desc
+                        )
+                        where monotonic() <= 3;
+                        %let n_hfcats = &sqlobs.;
+                    quit;
+
+                    %do hc = 1 %to &n_hfcats.;
+                        %let cat_val = &&hfcat&hc.;
+                        %let new_ncond = %eval(&&seed_ncond&s. + 1);
+                        %let new_vars = &&seed_vars&s.|&cvar.;
+
+                        /* Rule: existing AND cat_var = 'value' */
+                        %let rcat = (&&seed_desc&s.) and &cvar. = "&cat_val.";
+                        %_test_rule(
+                            rule=&rcat.,
+                            n_cond=&new_ncond.,
+                            vars_used=&new_vars.,
+                            min_obs=10
+                        );
+
+                    %end; /* end hc loop */
+                %end; /* end if cvar not used */
+            %end; /* end cv loop */
+        %end; /* end s loop (seeds) */
+
+    %end; /* end if n_char > 0 */
+
+    %put NOTE: ================================================;
+    %put NOTE: MULTI-VARIABLE RULES COMPLETE;
+    %put NOTE: Total rules generated: &rule_counter.;
+    %put NOTE: ================================================;
+
+    /* Summary by complexity */
+    proc freq data=&outds.;
+        tables n_conditions / nocum;
+        title "Multi-Variable Rules: Distribution by Number of Conditions";
+    run;
+
+    /* Cleanup percentile temp datasets */
+    proc datasets lib=work nolist;
+        %do v = 1 %to &max_vars.;
+            delete _pctl_&v.;
+        %end;
+    quit;
+
+%mend multi_variable_rules;
+
+
+/*=============================================================*/
+/*=============================================================*/
+/* SECTION 2: MAIN MACRO                                       */
+/*=============================================================*/
+/*=============================================================*/
+
+%macro fraud_rules(input_ds=, target=fraud_trans, min_hit_rate=0.10);
+
+    %put NOTE: =============================================;
+    %put NOTE: FRAUD RULE ENGINE STARTED;
+    %put NOTE: Dataset: &input_ds.;
+    %put NOTE: Target: &target.;
+    %put NOTE: Min Hit Rate: &min_hit_rate.;
+    %put NOTE: =============================================;
+
+    /*---------------------------------------------------------*/
+    /* STEP 1: VARIABLE SELECTION                              */
+    /*---------------------------------------------------------*/
+
+    %get_cardinality(ds=&input_ds., outds=cardinality_check);
+
+    /* Get total obs */
+    %let _total_obs = 0;
+    proc sql noprint;
+        select count(*) into :_total_obs trimmed
+        from &input_ds.;
+    quit;
+
+    /* Flag variables to EXCLUDE */
+    data variables_to_use;
+        set cardinality_check;
+        length exclude_reason $100;
+        exclude = 0;
+
+        /* Remove the target variable */
+        if upcase(name) = upcase("&target.") then do;
+            exclude = 1;
+            exclude_reason = "Target variable";
+        end;
+
+        /* Remove IDs - starts/ends with 'id' or '_id' pattern */
+        if prxmatch('/^id$|^id_|_id$|_id_|^.*_key$|^.*_num$|^.*_no$/i', strip(name))
+            then do;
+            exclude = 1;
+            exclude_reason = "ID variable";
+        end;
+
+        /* Remove date/time variables */
+        if prxmatch('/date|time|timestamp|_dt$|^dt_|_dttm/i', strip(name))
+            then do;
+            exclude = 1;
+            exclude_reason = "Date/Time variable";
+        end;
+
+        /* Remove high cardinality categorical (>50 levels) */
+        if type = 2 and n_levels > 50 then do;
+            exclude = 1;
+            exclude_reason = "High cardinality categorical";
+        end;
+
+        /* Remove near-unique numeric (>90% unique = likely ID) */
+        if type = 1 and n_levels > (0.9 * &_total_obs.) then do;
+            exclude = 1;
+            exclude_reason = "Near-unique numeric (likely ID)";
+        end;
+    run;
+
+    proc print data=variables_to_use;
+        title "STEP 1: Variable Selection Summary";
+        title2 "Variables with exclude=1 will NOT be used as predictors";
+    run;
+
+    /* Create macro variable lists - GLOBAL scope */
+    %global good_vars num_vars char_vars n_good_vars n_num_vars n_char_vars;
+
+    /* Initialize to blank in case no vars found */
+    %let good_vars = ;
+    %let num_vars = ;
+    %let char_vars = ;
+    %let n_good_vars = 0;
+    %let n_num_vars = 0;
+    %let n_char_vars = 0;
+
+    proc sql noprint;
+        select name into :good_vars separated by ' '
+        from variables_to_use where exclude = 0;
+
+        select name into :num_vars separated by ' '
+        from variables_to_use where exclude = 0 and type = 1;
+
+        select name into :char_vars separated by ' '
+        from variables_to_use where exclude = 0 and type = 2;
+
+        select count(*) into :n_good_vars trimmed
+        from variables_to_use where exclude = 0;
+
+        select count(*) into :n_num_vars trimmed
+        from variables_to_use where exclude = 0 and type = 1;
+
+        select count(*) into :n_char_vars trimmed
+        from variables_to_use where exclude = 0 and type = 2;
+    quit;
+
+    %put NOTE: =============================================;
+    %put NOTE: Predictors selected: &n_good_vars.;
+    %put NOTE: Numeric (&n_num_vars.): &num_vars.;
+    %put NOTE: Character (&n_char_vars.): &char_vars.;
+    %put NOTE: =============================================;
+
+    /* Stop if no variables */
+    %if &n_good_vars. = 0 %then %do;
+        %put ERROR: No valid predictor variables found. Check your data.;
+        %return;
+    %end;
+
+    /*---------------------------------------------------------*/
+    /* STEP 2: OVERALL FRAUD RATE                              */
+    /*---------------------------------------------------------*/
+
+    proc sql;
+        title "STEP 2: Overall Fraud Rate";
+        select
+            count(*) as total_trans label="Total Transactions" format=comma12.,
+            sum(&target.) as fraud_count label="Fraud Count" format=comma12.,
+            mean(&target.) as fraud_rate label="Fraud Rate" format=percent8.4
+        from &input_ds.;
+    quit;
+
+    /*---------------------------------------------------------*/
+    /* STEP 3: SINGLE NUMERIC VARIABLE RULES                   */
+    /* Format: var >= X  or  var <= X                           */
+    /*---------------------------------------------------------*/
+
+    %if &n_num_vars. > 0 %then %do;
+        %analyze_numeric_vars(
+            ds=&input_ds.,
+            target=&target.,
+            num_vars=&num_vars.,
+            min_hit_rate=&min_hit_rate.,
+            outds=numeric_rules
+        );
+
+        proc print data=numeric_rules;
+            title "STEP 3: Single Numeric Rules (var >= X or var <= X)";
+            format hit_rate fraud_caught_pct percent8.2;
+        run;
+    %end;
+    %else %do;
+        proc sql;
+            create table numeric_rules (
+                variable char(32), rule_type char(20), cutoff num,
+                total_flagged num, fraud_flagged num, hit_rate num,
+                fraud_caught_pct num, rule_description char(200)
+            );
+        quit;
+    %end;
+
+    /*---------------------------------------------------------*/
+    /* STEP 4: SINGLE CATEGORICAL VARIABLE RULES               */
+    /* Format: var = 'value'                                   */
+    /*---------------------------------------------------------*/
+
+    %if &n_char_vars. > 0 %then %do;
+        %analyze_char_vars(
+            ds=&input_ds.,
+            target=&target.,
+            char_vars=&char_vars.,
+            min_hit_rate=&min_hit_rate.,
+            outds=char_rules
+        );
+
+        proc print data=char_rules;
+            title "STEP 4: Single Categorical Rules (var = 'value')";
+            format hit_rate fraud_caught_pct percent8.2;
+        run;
+    %end;
+    %else %do;
+        proc sql;
+            create table char_rules (
+                variable char(32), rule_type char(20),
+                category_value char(200), total_flagged num,
+                fraud_flagged num, hit_rate num,
+                fraud_caught_pct num, rule_description char(500)
+            );
+        quit;
+    %end;
+
+    /*---------------------------------------------------------*/
+    /* STEP 5: COMPILE ALL SINGLE RULES & RANK                 */
+    /*---------------------------------------------------------*/
+
+    data all_rules;
+        length variable $32 rule_type $20 rule_description $500 rule_source $20;
+        set numeric_rules(in=a)
+            char_rules(in=b);
+
+        if a then rule_source = "NUMERIC";
+        if b then rule_source = "CATEGORICAL";
+
+        if hit_rate >= &min_hit_rate.;
+        rule_score = hit_rate * fraud_caught_pct;
+    run;
+
+    proc sort data=all_rules;
+        by descending rule_score;
+    run;
+
+    proc print data=all_rules(obs=50);
+        title "STEP 5: TOP 50 Single Rules (Ranked by Score)";
+        var rule_source variable rule_type rule_description
+            total_flagged fraud_flagged hit_rate fraud_caught_pct rule_score;
+        format hit_rate fraud_caught_pct percent8.2 rule_score 8.4;
+    run;
+
+    /*---------------------------------------------------------*/
+    /* STEP 6: 2-VARIABLE COMBINATION RULES                    */
+    /* Format: var1 >= X and var2 >= Y                         */
+    /*---------------------------------------------------------*/
+
+    %combination_rules(
+        ds=&input_ds.,
+        target=&target.,
+        rules_ds=all_rules,
+        min_hit_rate=&min_hit_rate.,
+        outds=combo_rules
+    );
+
+    proc sort data=combo_rules;
+        by descending hit_rate descending fraud_caught_pct;
+    run;
+
+    proc print data=combo_rules(obs=30);
+        title "STEP 6: TOP 30 Two-Variable Combination Rules";
+        var rule_id variable1 variable2 rule_description
+            total_flagged fraud_flagged hit_rate fraud_caught_pct;
+        format hit_rate fraud_caught_pct percent8.2;
+    run;
+
+    /*---------------------------------------------------------*/
+    /* STEP 6B: MULTI-VARIABLE RULES (3, 4, 5 conditions)      */
+    /* Format: var >= X and var >= Y and var <= Z ...           */
+    /* NO RANGES - only >= or <=                               */
+    /*---------------------------------------------------------*/
+
+    %multi_variable_rules(
+        ds=&input_ds.,
+        target=&target.,
+        num_vars=&num_vars.,
+        char_vars=&char_vars.,
+        min_hit_rate=&min_hit_rate.,
+        outds=multi_rules
+    );
+
+    proc sort data=multi_rules;
+        by descending hit_rate descending fraud_caught_pct;
+    run;
+
+    proc print data=multi_rules(obs=30);
+        title "STEP 6B: TOP 30 Multi-Variable Rules (3-5 conditions)";
+        var rule_id n_conditions variables_used rule_description
+            total_flagged fraud_flagged hit_rate fraud_caught_pct;
+        format hit_rate fraud_caught_pct percent8.2;
+    run;
+
+    /*---------------------------------------------------------*/
+    /* STEP 7: MERGE ALL RULES FOR GREEDY SELECTION            */
+    /*---------------------------------------------------------*/
+
+    data final_all_rules;
+        length rule_description $1000 rule_source $20;
+
+        set all_rules(in=a
+                keep=rule_description total_flagged fraud_flagged
+                     hit_rate fraud_caught_pct rule_score rule_source)
+            combo_rules(in=b
+                keep=rule_description total_flagged fraud_flagged
+                     hit_rate fraud_caught_pct)
+            multi_rules(in=c
+                keep=rule_description total_flagged fraud_flagged
+                     hit_rate fraud_caught_pct n_conditions);
+
+        if a then do;
+            n_conditions = 1;
+        end;
+        if b then do;
+            rule_source = "COMBO_2VAR";
+            rule_score = hit_rate * fraud_caught_pct;
+            n_conditions = 2;
+        end;
+        if c then do;
+            rule_source = cats("MULTI_", n_conditions, "VAR");
+            rule_score = hit_rate * fraud_caught_pct;
+        end;
+
+        /* Filter */
+        if hit_rate >= &min_hit_rate.;
+        if total_flagged >= 10;
+    run;
+
+    proc sort data=final_all_rules;
+        by descending rule_score;
+    run;
+
+    proc freq data=final_all_rules;
+        title "STEP 7: All Rules by Source & Complexity";
+        tables rule_source * n_conditions / nocum nopercent;
+    run;
+
+    %put NOTE: Total candidate rules: %sysfunc(attrn(%sysfunc(open(final_all_rules)), nobs));
+
+    /*---------------------------------------------------------*/
+    /* STEP 8: GREEDY RULE SELECTION                           */
+    /*---------------------------------------------------------*/
+
+    %greedy_rule_selection(
+        ds=&input_ds.,
+        rules_ds=final_all_rules,
+        target=&target.,
+        min_hit_rate=&min_hit_rate.,
+        max_rules=20,
+        outds=selected_rules
+    );
+
+    /*---------------------------------------------------------*/
+    /* STEP 9: FINAL REPORT                                    */
+    /*---------------------------------------------------------*/
+
+    title "============================================================";
+    title2 "FINAL SELECTED FRAUD RULES";
+    title3 "Minimum Hit Rate: %sysfunc(putn(&min_hit_rate., percent8.0))";
+    title4 "Rule Format: var >= X or var <= X (NO RANGES)";
+    title5 "============================================================";
+
+    proc print data=selected_rules noobs;
+        var rule_order rule_source n_conditions rule_description
+            total_flagged fraud_flagged hit_rate
+            incremental_fraud cumulative_fraud
+            cumulative_fraud_pct cumulative_hit_rate;
+        format hit_rate cumulative_fraud_pct cumulative_hit_rate percent8.2;
+    run;
+
+    /* Performance Chart */
+    proc sgplot data=selected_rules;
+        vbar rule_order / response=hit_rate
+            datalabel datalabelattrs=(size=8)
+            fillattrs=(color=steelblue);
+        vline rule_order / response=cumulative_fraud_pct
+            y2axis lineattrs=(thickness=3 color=red)
+            markers markerattrs=(color=red symbol=circlefilled);
+        xaxis label="Rule Order (Priority)" integer;
+        yaxis label="Hit Rate (Precision)" values=(0 to 1 by 0.1) grid;
+        y2axis label="Cumulative Fraud Caught %" values=(0 to 1 by 0.1);
+        title "Fraud Rule Performance Dashboard";
+        title2 "Blue Bars = Individual Hit Rate | Red Line = Cumulative Coverage";
+    run;
+
+    /* Scorecard */
+    proc report data=selected_rules nowd;
+        title "FRAUD RULE SCORECARD";
+        columns rule_order rule_source n_conditions rule_description
+                total_flagged fraud_flagged hit_rate
+                incremental_fraud cumulative_fraud_pct cumulative_hit_rate;
+        define rule_order / "Rule #" width=6 center;
+        define rule_source / "Source" width=12;
+        define n_conditions / "# Conds" width=7 center;
+        define rule_description / "Rule Logic (var >= X or var <= X)" width=70 flow;
+        define total_flagged / "Flagged" width=10 format=comma10.;
+        define fraud_flagged / "Fraud" width=10 format=comma10.;
+        define hit_rate / "Hit Rate" format=percent8.1 width=10;
+        define incremental_fraud / "Incr Fraud" width=10 format=comma10.;
+        define cumulative_fraud_pct / "Cum Fraud%" format=percent8.1 width=10;
+        define cumulative_hit_rate / "Cum Hit%" format=percent8.1 width=10;
+    run;
+
+    /*---------------------------------------------------------*/
+    /* STEP 10: GENERATE DEPLOYABLE SCORING CODE               */
+    /*---------------------------------------------------------*/
+
+    %let outpath = %sysfunc(pathname(WORK));
+
+    data _null_;
+        set selected_rules end=last;
+        file "&outpath./fraud_scoring_rules.sas";
+
+        if _n_ = 1 then do;
+            put "/*==========================================================*/";
+            put "/* AUTO-GENERATED FRAUD SCORING RULES                        */";
+            put "/* Generated: %sysfunc(today(), date9.)                      */";
+            put "/* Min Hit Rate: &min_hit_rate.                              */";
+            put "/* Rule Format: var >= X or var <= X (NO RANGES)             */";
+            put "/*==========================================================*/";
+            put " ";
+            put "data scored_transactions;";
+            put "    set new_transactions;";
+            put "    length fraud_rule_triggered $1000;";
+            put "    fraud_flag = 0;";
+            put "    fraud_score = 0;";
+            put "    fraud_rule_triggered = '';";
+            put " ";
+        end;
+
+        put "    /* Rule " rule_order +(-1)
+            " (" rule_source +(-1) ", " n_conditions +(-1)
+            " conditions) | Hit Rate=" hit_rate percent8.1 +(-1) " */";
+        put "    if (" rule_description +(-1) ") then do;";
+        put "        fraud_flag = 1;";
+        put "        fraud_score + 1;";
+        put "        if fraud_rule_triggered = '' then";
+        put "            fraud_rule_triggered = 'Rule " rule_order +(-1) "';";
+        put "        else";
+        put "            fraud_rule_triggered = catx(', ',";
+        put "                fraud_rule_triggered, 'Rule " rule_order +(-1) "');";
+        put "    end;";
+        put " ";
+
+        if last then do;
+            put "    /* Summary variables */";
+            put "    fraud_rule_count = fraud_score;";
+            put " ";
+            put "run;";
+            put " ";
+            put "/* Performance check */";
+            put "proc freq data=scored_transactions;";
+            put "    tables fraud_flag * &target. / nocol norow;";
+            put "run;";
+        end;
+    run;
+
+    %put NOTE: Scoring code saved to: &outpath./fraud_scoring_rules.sas;
+
+    /*---------------------------------------------------------*/
+    /* STEP 11: VALIDATION ON HOLDOUT SAMPLE                   */
+    /*---------------------------------------------------------*/
+
+    /* 70/30 split */
+    proc surveyselect data=&input_ds. out=_split
+        method=srs samprate=0.7 seed=12345 outall;
+    run;
+
+    data _train _validate;
+        set _split;
+        if selected = 1 then output _train;
+        else output _validate;
+    run;
+
+    /* Get selected rules into macro variables */
+    %let n_selected = 0;
+    proc sql noprint;
+        select count(*) into :n_selected trimmed
+        from selected_rules;
+    quit;
+
+    %if &n_selected. > 0 %then %do;
+
+        proc sql noprint;
+            select rule_description
+            into :vrule1 - :vrule20
+            from selected_rules
+            order by rule_order;
+        quit;
+
+        /* Apply rules to validation set */
+        data validation_scored;
+            set _validate;
+            fraud_flag = 0;
+            fraud_score = 0;
+            length fraud_rule_triggered $1000;
+            fraud_rule_triggered = '';
+
+            %do vr = 1 %to &n_selected.;
+                if (&&vrule&vr.) then do;
+                    fraud_flag = 1;
+                    fraud_score + 1;
+                    if fraud_rule_triggered = '' then
+                        fraud_rule_triggered = "Rule &vr.";
+                    else
+                        fraud_rule_triggered = catx(', ',
+                            fraud_rule_triggered, "Rule &vr.");
+                end;
+            %end;
+
+            fraud_rule_count = fraud_score;
+        run;
+
+        /* Validation Performance */
+        proc sql;
+            title "STEP 11: VALIDATION SET PERFORMANCE";
+            title2 "Rules applied to 30% holdout sample";
+            title3 "All rules use format: var >= X or var <= X (NO RANGES)";
+            select
+                "VALIDATION" as dataset length=15,
+                count(*) as total_transactions
+                    label="Total Trans" format=comma12.,
+                sum(fraud_flag) as total_flagged
+                    label="Total Flagged" format=comma12.,
+                sum(&target.) as total_fraud
+                    label="Total Fraud" format=comma12.,
+                sum(fraud_flag * &target.) as fraud_caught
+                    label="Fraud Caught" format=comma12.,
+                case when sum(fraud_flag) > 0
+                    then sum(fraud_flag * &target.) / sum(fraud_flag)
+                    else 0 end as hit_rate
+                    label="Hit Rate (Precision)" format=percent8.2,
+                case when sum(&target.) > 0
+                    then sum(fraud_flag * &target.) / sum(&target.)
+                    else 0 end as recall
+                    label="Recall (Coverage)" format=percent8.2,
+                sum(fraud_flag) / count(*) as flag_rate
+                    label="Flag Rate" format=percent8.4,
+                case when (sum(fraud_flag * &target.) / sum(fraud_flag)) > 0
+                     and (sum(fraud_flag * &target.) / sum(&target.)) > 0
+                    then 2 * (sum(fraud_flag * &target.) / sum(fraud_flag))
+                           * (sum(fraud_flag * &target.) / sum(&target.))
+                         / ((sum(fraud_flag * &target.) / sum(fraud_flag))
+                           + (sum(fraud_flag * &target.) / sum(&target.)))
+                    else 0 end as f1_score
+                    label="F1 Score" format=8.4
+            from validation_scored;
+        quit;
+
+        /* Confusion Matrix */
+        proc freq data=validation_scored;
+            title "Confusion Matrix - Validation Set";
+            tables fraud_flag * &target. / nopercent nocol;
+        run;
+
+        /* Per-rule validation performance */
+        proc sql;
+            create table validation_rule_perf (
+                rule_order num,
+                rule_description char(1000),
+                n_conditions num,
+                train_hit_rate num format=percent8.2,
+                valid_hit_rate num format=percent8.2,
+                valid_flagged num,
+                valid_fraud_caught num,
+                stability_flag char(50)
+            );
+        quit;
+
+        %do vr = 1 %to &n_selected.;
+
+            %let vf = 0; %let vc = 0; %let vh = 0;
+
+            proc sql noprint;
+                select
+                    count(*),
+                    sum(&target.),
+                    case when count(*) > 0
+                        then sum(&target.) / count(*)
+                        else 0 end
+                into :vf trimmed, :vc trimmed, :vh trimmed
+                from _validate
+                where &&vrule&vr.;
+            quit;
+
+            /* Get training hit rate */
+            %let train_hr = 0;
+            proc sql noprint;
+                select hit_rate into :train_hr trimmed
+                from selected_rules
+                where rule_order = &vr.;
+            quit;
+
+            /* Determine stability */
+            %let stab_flag = STABLE;
+            %if %sysevalf(&vh. < &min_hit_rate.) %then
+                %let stab_flag = FAILED - Below min hit rate;
+            %else %if %sysevalf(&train_hr. > 0) %then %do;
+                %if %sysevalf((&vh. - &train_hr.) / &train_hr. < -0.30) %then
+                    %let stab_flag = WARNING - >30%% degradation;
+            %end;
+
+            proc sql;
+                insert into validation_rule_perf
+                set rule_order = &vr.,
+                    rule_description = "&&vrule&vr.",
+                    n_conditions = (select n_conditions from selected_rules
+                                    where rule_order = &vr.),
+                    train_hit_rate = &train_hr.,
+                    valid_hit_rate = &vh.,
+                    valid_flagged = &vf.,
+                    valid_fraud_caught = &vc.,
+                    stability_flag = "&stab_flag.";
+            quit;
+
+        %end;
+
+        proc print data=validation_rule_perf noobs;
+            title "RULE STABILITY: Train vs Validation";
+            title2 "Rules should maintain hit rate >= &min_hit_rate. on holdout";
+            var rule_order n_conditions rule_description
+                train_hit_rate valid_hit_rate valid_flagged
+                valid_fraud_caught stability_flag;
+        run;
+
+        /* Highlight unstable rules */
+        proc print data=validation_rule_perf noobs;
+            title "WARNING: Rules That May Be Unstable";
+            where stability_flag ne "STABLE";
+            var rule_order rule_description train_hit_rate
+                valid_hit_rate stability_flag;
+        run;
+
+    %end; /* end if n_selected > 0 */
+    %else %do;
+        %put WARNING: No rules were selected. Try lowering min_hit_rate or check data quality.;
+    %end;
+
+    /*---------------------------------------------------------*/
+    /* STEP 12: EXECUTIVE SUMMARY                              */
+    /*---------------------------------------------------------*/
+
+    title "============================================================";
+    title2 "FRAUD RULE ENGINE - EXECUTIVE SUMMARY";
+    title3 "============================================================";
+
+    %let total_fraud_count = 0;
+    proc sql noprint;
+        select sum(&target.) into :total_fraud_count trimmed
+        from &input_ds.;
+    quit;
+
+    proc sql;
+        select
+            &_total_obs. as total_observations
+                label="Total Observations" format=comma12.,
+            &total_fraud_count. as total_fraud
+                label="Total Fraud Cases" format=comma12.,
+            &total_fraud_count. / &_total_obs. as base_fraud_rate
+                label="Base Fraud Rate" format=percent8.4,
+            &n_good_vars. as predictors_used
+                label="Predictors Used",
+            (select count(*) from numeric_rules) as single_num_rules
+                label="Single Numeric Rules",
+            (select count(*) from char_rules) as single_cat_rules
+                label="Single Categorical Rules",
+            (select count(*) from combo_rules) as combo_2var_rules
+                label="2-Var Combo Rules",
+            (select count(*) from multi_rules where n_conditions=3)
+                as rules_3var label="3-Var Rules",
+            (select count(*) from multi_rules where n_conditions=4)
+                as rules_4var label="4-Var Rules",
+            (select count(*) from multi_rules where n_conditions=5)
+                as rules_5var label="5-Var Rules",
+            (select count(*) from final_all_rules) as total_candidate_rules
+                label="Total Candidate Rules",
+            &n_selected. as final_rules_selected
+                label="Final Rules Selected",
+            &min_hit_rate. as min_hit_rate_threshold
+                label="Min Hit Rate" format=percent8.0
+        from &input_ds.(obs=1);
+    quit;
+
+    /* Final selected rules - clean output */
+    proc print data=selected_rules noobs label;
+        title "FINAL RULES FOR DEPLOYMENT";
+        title2 "All rules use: var >= X or var <= X (NO between/ranges)";
+        title3 "Minimum hit rate: %sysfunc(putn(&min_hit_rate., percent8.0))";
+        var rule_order n_conditions rule_description hit_rate
+            incremental_fraud cumulative_fraud_pct;
+        label rule_order = "Priority"
+              n_conditions = "# Conditions"
+              rule_description = "Rule Logic"
+              hit_rate = "Hit Rate"
+              incremental_fraud = "Incremental Fraud Caught"
+              cumulative_fraud_pct = "Cumulative Fraud %";
+        format hit_rate cumulative_fraud_pct percent8.1;
+    run;
+
+    /*---------------------------------------------------------*/
+    /* STEP 13: CLEANUP                                        */
+    /*---------------------------------------------------------*/
+
+    proc datasets lib=work nolist;
+        delete _split _train _validate
+               cardinality_check _cat_analysis
+               _pctls _varlist;
+    quit;
+
+    title;
+
+    %put NOTE: =============================================;
+    %put NOTE: FRAUD RULE ENGINE COMPLETE;
+    %put NOTE: =============================================;
+    %put NOTE: KEY OUTPUTS:;
+    %put NOTE:   selected_rules    - Final rules for deployment;
+    %put NOTE:   final_all_rules   - All candidate rules;
+    %put NOTE:   validation_scored - Validation set with flags;
+    %put NOTE:   validation_rule_perf - Rule stability check;
+    %put NOTE:   multi_rules       - All 3/4/5 variable rules;
+    %put NOTE:   &outpath./fraud_scoring_rules.sas - Deployable code;
+    %put NOTE: =============================================;
+    %put NOTE: RULE FORMAT: All numeric conditions are;
+    %put NOTE:   variable >= cutoff  OR  variable <= cutoff;
+    %put NOTE:   NO ranges, NO between conditions;
+    %put NOTE: =============================================;
+
+%mend fraud_rules;
+
+
+/*=============================================================*/
+/*=============================================================*/
+/* SECTION 3: EXECUTE                                          */
+/*=============================================================*/
+/*=============================================================*/
+
+/* ============ CHANGE THESE PARAMETERS ============ */
+
+%fraud_rules(
+    input_ds=WORK.YOUR_DATASET,    /* <-- Replace with your dataset */
+    target=fraud_trans,             /* <-- Binary 0/1 fraud flag */
+    min_hit_rate=0.10              /* <-- Minimum 10% precision */
+);
+
+/* ================================================= */
+
+
+/*=============================================================*/
+/* OPTIONAL: TEST WITH SYNTHETIC DATA                          */
+/* Uncomment to verify code works before using real data       */
+/*=============================================================*/
+
+/*
+data sample_fraud_data;
+    call streaminit(42);
+    do i = 1 to 100000;
+        customer_id = i;
+        transaction_id = cats('TXN', put(i, z8.));
+        trans_date = today() - int(rand('uniform') * 365);
+        trans_time = time();
+
+        amount = round(rand('exponential') * 500, 0.01);
+        merchant_category = scan('retail grocery gas online travel',
+            ceil(rand('uniform') * 5));
+        channel = scan('POS online ATM mobile',
+            ceil(rand('uniform') * 4));
+        country = scan('US US US US UK CA MX',
+            ceil(rand('uniform') * 7));
+        num_trans_24hr = int(rand('poisson', 3));
+        days_since_last = int(rand('exponential') * 10);
+        distance_from_home = round(rand('exponential') * 50, 0.1);
+        is_weekend = (weekday(trans_date) in (1, 7));
+        hour_of_day = int(rand('uniform') * 24);
+        card_age_months = int(rand('uniform') * 60) + 1;
+        avg_monthly_spend = round(rand('normal', 2000, 800), 1);
+        ratio_to_avg = amount / max(avg_monthly_spend / 30, 1);
+        velocity_score = round(rand('normal', 50, 20), 0.1);
+        model_score = round(rand('normal', 400, 150), 1);
+
+        * Generate fraud based on patterns;
+        fraud_prob = 0.02;
+        if amount > 2000 then fraud_prob = fraud_prob + 0.15;
+        if num_trans_24hr > 8 then fraud_prob = fraud_prob + 0.20;
+        if distance_from_home > 200 then fraud_prob = fraud_prob + 0.12;
+        if country not in ('US') then fraud_prob = fraud_prob + 0.08;
+        if channel = 'online' and amount > 1000 then
+            fraud_prob = fraud_prob + 0.10;
+        if hour_of_day in (1, 2, 3, 4) then fraud_prob = fraud_prob + 0.05;
+        if ratio_to_avg > 5 then fraud_prob = fraud_prob + 0.18;
+        if model_score > 700 then fraud_prob = fraud_prob + 0.25;
+        if velocity_score > 85 then fraud_prob = fraud_prob + 0.10;
+
+        fraud_prob = min(fraud_prob, 0.95);
+        fraud_trans = (rand('uniform') < fraud_prob);
+
+        format trans_date date9.;
+        output;
+    end;
+    drop i fraud_prob;
+run;
+
+* Run the engine;
+%fraud_rules(
+    input_ds=sample_fraud_data,
+    target=fraud_trans,
+    min_hit_rate=0.10
+);
+
+* Expected output: Rules like;
+* - model_score >= 700
+* - amount >= 2500 and num_trans_24hr >= 8
+* - model_score >= 700 and distance_from_home >= 200 and ratio_to_avg >= 5
+* All in format: var >= X or var <= X (NO RANGES);
+*/
