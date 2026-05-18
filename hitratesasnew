@@ -500,6 +500,509 @@
 
 %mend greedy_rule_selection;
 
+/*=============================================================*/
+/* SUB-MACRO 6: MULTI-VARIABLE RULES (3, 4, 5 conditions)     */
+/* Uses DECISION TREE paths to find multi-condition rules      */
+/*=============================================================*/
+
+%macro multi_variable_rules(ds=, target=, num_vars=, char_vars=,
+                            min_hit_rate=0.10, max_depth=5,
+                            outds=multi_rules);
+
+    /*---------------------------------------------------------*/
+    /* APPROACH 1: Decision Tree Leaf Nodes as Rules            */
+    /* Each leaf path = a multi-variable rule                   */
+    /*---------------------------------------------------------*/
+
+    /* Build a decision tree */
+    %let all_pred = &num_vars. &char_vars.;
+    %let n_char = %sysfunc(countw(&char_vars., %str( )));
+
+    proc decision data=&ds. maxdepth=&max_depth.;
+        %if &n_char. > 0 %then %do;
+            class &char_vars. &target.;
+        %end;
+        %else %do;
+            class &target.;
+        %end;
+        model &target.(event='1') = &all_pred.;
+        prune costcomplexity;
+        output out=_tree_out p=tree_prob;
+    run;
+
+    /* If PROC DECISION not available, use PROC HPSPLIT */
+    /* Fallback: manual multi-variable rule generation */
+
+    /*---------------------------------------------------------*/
+    /* APPROACH 2: Iterative Rule Building (Guaranteed to work) */
+    /* Start with best 2-var rules, add variables one at a time */
+    /*---------------------------------------------------------*/
+
+    proc sql;
+        create table &outds. (
+            rule_id num,
+            n_conditions num,
+            rule_description char(1000),
+            total_flagged num,
+            fraud_flagged num,
+            hit_rate num,
+            fraud_caught_pct num,
+            variables_used char(500)
+        );
+    quit;
+
+    /* Get top 2-variable rules as seeds */
+    %let n_seeds = 0;
+    proc sql noprint;
+        select count(*) into :n_seeds trimmed
+        from combo_rules;
+    quit;
+
+    %if &n_seeds. = 0 %then %do;
+        %put NOTE: No 2-variable rules found. Using top single rules as seeds.;
+        /* Use top single rules and build up */
+        proc sql noprint;
+            select rule_description, variable
+            into :seed1-:seed10, :seedvar1-:seedvar10
+            from (
+                select *, monotonic() as rn
+                from all_rules
+            )
+            where rn <= 10;
+            %let n_seeds = &sqlobs.;
+        quit;
+    %end;
+    %else %do;
+        proc sql noprint;
+            select rule_description, cats(variable1, '|', variable2)
+            into :seed1-:seed10, :seedvar1-:seedvar10
+            from (
+                select *, monotonic() as rn
+                from combo_rules
+                order by hit_rate * fraud_caught_pct desc
+            )
+            where rn <= 10;
+            %let n_seeds = %sysfunc(min(&sqlobs., 10));
+        quit;
+    %end;
+
+    /* For each seed rule, try adding more conditions */
+    %let rule_counter = 0;
+
+    %do s = 1 %to &n_seeds.;
+
+        %let base_rule = &&seed&s.;
+        %let used_vars = &&seedvar&s.;
+
+        /* Try adding each numeric variable */
+        %let n_num = %sysfunc(countw(&num_vars., %str( )));
+
+        %do nv = 1 %to &n_num.;
+            %let add_var = %scan(&num_vars., &nv., %str( ));
+
+            /* Skip if variable already in rule */
+            %if %index(&used_vars., &add_var.) = 0 %then %do;
+
+                /* Get percentiles for this variable */
+                proc univariate data=&ds. noprint;
+                    var &add_var.;
+                    output out=_mp pctlpts=10 25 75 90 95
+                           pctlpre=mp;
+                run;
+
+                data _null_;
+                    set _mp;
+                    call symputx('mp10', mp10);
+                    call symputx('mp25', mp25);
+                    call symputx('mp75', mp75);
+                    call symputx('mp90', mp90);
+                    call symputx('mp95', mp95);
+                run;
+
+                /* Test adding >= p75, p90, p95 */
+                %let add_cuts = 75 90 95;
+                %do ac = 1 %to 3;
+                    %let apct = %scan(&add_cuts., &ac.);
+                    %let aval = &&mp&apct.;
+
+                    %if &aval. ne . %then %do;
+                        /* 3-variable rule: base + new condition (greater) */
+                        %let new_rule = (&base_rule.) and &add_var. >= &aval.;
+
+                        proc sql noprint;
+                            select
+                                count(*),
+                                sum(&target.),
+                                case when count(*) > 0
+                                    then sum(&target.) / count(*)
+                                    else 0 end,
+                                case when (select sum(&target.) from &ds.) > 0
+                                    then sum(&target.) /
+                                         (select sum(&target.) from &ds.)
+                                    else 0 end
+                            into :mf trimmed, :mc trimmed,
+                                 :mh trimmed, :mfp trimmed
+                            from &ds.
+                            where &new_rule.;
+                        quit;
+
+                        %if %sysevalf(&mh. >= &min_hit_rate.) and
+                            %sysevalf(&mf. >= 20) %then %do;
+
+                            %let rule_counter = %eval(&rule_counter. + 1);
+                            %let new_vars = &used_vars.|&add_var.;
+
+                            proc sql;
+                                insert into &outds.
+                                set rule_id = &rule_counter.,
+                                    n_conditions = %eval(
+                                        %sysfunc(countw(&new_vars., |))),
+                                    rule_description = "&new_rule.",
+                                    total_flagged = &mf.,
+                                    fraud_flagged = &mc.,
+                                    hit_rate = &mh.,
+                                    fraud_caught_pct = &mfp.,
+                                    variables_used = "&new_vars.";
+                            quit;
+
+                            /*-----------------------------------------*/
+                            /* NOW TRY ADDING A 4TH VARIABLE           */
+                            /*-----------------------------------------*/
+                            %do nv2 = 1 %to &n_num.;
+                                %let add_var2 = %scan(&num_vars., &nv2.,
+                                                      %str( ));
+
+                                %if %index(&new_vars., &add_var2.) = 0
+                                    %then %do;
+
+                                    /* Get percentiles for 4th var */
+                                    proc univariate data=&ds. noprint;
+                                        var &add_var2.;
+                                        output out=_mp2
+                                            pctlpts=75 90 95
+                                            pctlpre=mp2_;
+                                    run;
+
+                                    data _null_;
+                                        set _mp2;
+                                        call symputx('mp2_75', mp2_75);
+                                        call symputx('mp2_90', mp2_90);
+                                        call symputx('mp2_95', mp2_95);
+                                    run;
+
+                                    %let add_cuts2 = 75 90 95;
+                                    %do ac2 = 1 %to 3;
+                                        %let apct2 = %scan(&add_cuts2.,
+                                                           &ac2.);
+                                        %let aval2 = &&mp2_&apct2.;
+
+                                        %if &aval2. ne . %then %do;
+                                            %let rule_4var =
+                                                (&new_rule.) and
+                                                &add_var2. >= &aval2.;
+
+                                            proc sql noprint;
+                                                select
+                                                    count(*),
+                                                    sum(&target.),
+                                                    case when count(*) > 0
+                                                        then sum(&target.)
+                                                             / count(*)
+                                                        else 0 end,
+                                                    case when
+                                                        (select sum(&target.)
+                                                         from &ds.) > 0
+                                                        then sum(&target.) /
+                                                            (select
+                                                             sum(&target.)
+                                                             from &ds.)
+                                                        else 0 end
+                                                into :mf4 trimmed,
+                                                     :mc4 trimmed,
+                                                     :mh4 trimmed,
+                                                     :mfp4 trimmed
+                                                from &ds.
+                                                where &rule_4var.;
+                                            quit;
+
+                                            %if %sysevalf(
+                                                &mh4. >= &min_hit_rate.)
+                                                and %sysevalf(
+                                                &mf4. >= 15) %then %do;
+
+                                                %let rule_counter =
+                                                    %eval(&rule_counter.
+                                                          + 1);
+                                                %let vars_4 =
+                                                    &new_vars.|&add_var2.;
+
+                                                proc sql;
+                                                    insert into &outds.
+                                                    set rule_id =
+                                                        &rule_counter.,
+                                                        n_conditions =
+                                                        %eval(%sysfunc(
+                                                            countw(
+                                                            &vars_4., |))),
+                                                        rule_description =
+                                                            "&rule_4var.",
+                                                        total_flagged =
+                                                            &mf4.,
+                                                        fraud_flagged =
+                                                            &mc4.,
+                                                        hit_rate = &mh4.,
+                                                        fraud_caught_pct =
+                                                            &mfp4.,
+                                                        variables_used =
+                                                            "&vars_4.";
+                                                quit;
+
+                                            /*-----------------------------*/
+                                            /* TRY ADDING 5TH VARIABLE     */
+                                            /*-----------------------------*/
+                                            %do nv3 = 1 %to
+                                                %sysfunc(min(&n_num., 8));
+                                                %let add_var3 =
+                                                    %scan(&num_vars.,
+                                                          &nv3., %str( ));
+
+                                                %if %index(&vars_4.,
+                                                    &add_var3.) = 0
+                                                    %then %do;
+
+                                                    proc univariate
+                                                        data=&ds. noprint;
+                                                        var &add_var3.;
+                                                        output out=_mp3
+                                                            pctlpts=75 90
+                                                            pctlpre=mp3_;
+                                                    run;
+
+                                                    data _null_;
+                                                        set _mp3;
+                                                        call symputx(
+                                                            'mp3_75',
+                                                            mp3_75);
+                                                        call symputx(
+                                                            'mp3_90',
+                                                            mp3_90);
+                                                    run;
+
+                                                    %let add_cuts3 = 75 90;
+                                                    %do ac3 = 1 %to 2;
+                                                        %let apct3 =
+                                                            %scan(
+                                                            &add_cuts3.,
+                                                            &ac3.);
+                                                        %let aval3 =
+                                                            &&mp3_&apct3.;
+
+                                                        %if &aval3. ne .
+                                                            %then %do;
+                                                            %let rule_5var=
+                                                                (&rule_4var.
+                                                                ) and
+                                                                &add_var3.
+                                                                >= &aval3.;
+
+                                                            proc sql noprint;
+                                                              select
+                                                                count(*),
+                                                                sum(&target.),
+                                                                case when
+                                                                  count(*)>0
+                                                                  then
+                                                                  sum(
+                                                                  &target.)
+                                                                  /count(*)
+                                                                  else 0
+                                                                  end,
+                                                                case when
+                                                                  (select
+                                                                  sum(
+                                                                  &target.)
+                                                                  from &ds.)
+                                                                  > 0
+                                                                  then
+                                                                  sum(
+                                                                  &target.)
+                                                                  /(select
+                                                                  sum(
+                                                                  &target.)
+                                                                  from &ds.)
+                                                                  else 0
+                                                                  end
+                                                              into
+                                                                :mf5 trimmed,
+                                                                :mc5 trimmed,
+                                                                :mh5 trimmed,
+                                                                :mfp5 trimmed
+                                                              from &ds.
+                                                              where
+                                                                &rule_5var.;
+                                                            quit;
+
+                                                            %if %sysevalf(
+                                                                &mh5. >=
+                                                                &min_hit_rate.
+                                                                ) and
+                                                                %sysevalf(
+                                                                &mf5. >= 10)
+                                                                %then %do;
+
+                                                              %let
+                                                                rule_counter=
+                                                                %eval(
+                                                                &rule_counter.
+                                                                + 1);
+                                                              %let vars_5 =
+                                                                &vars_4.
+                                                                |&add_var3.;
+
+                                                              proc sql;
+                                                                insert into
+                                                                  &outds.
+                                                                set
+                                                                  rule_id=
+                                                                  &rule_counter.,
+                                                                  n_conditions
+                                                                  = %eval(
+                                                                  %sysfunc(
+                                                                  countw(
+                                                                  &vars_5.,
+                                                                  |))),
+                                                                  rule_description
+                                                                  =
+                                                                  "&rule_5var.",
+                                                                  total_flagged
+                                                                  = &mf5.,
+                                                                  fraud_flagged
+                                                                  = &mc5.,
+                                                                  hit_rate
+                                                                  = &mh5.,
+                                                                  fraud_caught_pct
+                                                                  = &mfp5.,
+                                                                  variables_used
+                                                                  =
+                                                                  "&vars_5.";
+                                                              quit;
+
+                                                            %end;
+                                                        %end;
+                                                    %end;
+                                                %end;
+                                            %end;
+
+                                            %end; /* end if 4var qualifies */
+                                        %end; /* end if aval2 not missing */
+                                    %end; /* end ac2 loop */
+                                %end; /* end if var not already used */
+                            %end; /* end nv2 loop */
+
+                        %end; /* end if 3var qualifies */
+                    %end; /* end if aval not missing */
+                %end; /* end ac loop */
+
+            %end; /* end if var not in rule */
+        %end; /* end nv loop */
+
+        /* Also try adding categorical variables */
+        %if &n_char. > 0 %then %do;
+            %do cv = 1 %to %sysfunc(min(&n_char., 5));
+                %let add_cvar = %scan(&char_vars., &cv., %str( ));
+
+                %if %index(&used_vars., &add_cvar.) = 0 %then %do;
+
+                    /* Find high-fraud categories for this variable */
+                    proc sql noprint;
+                        select &add_cvar.
+                        into :hf_cat1-:hf_cat5
+                        from (
+                            select &add_cvar.,
+                                sum(&target.) / count(*) as cat_hr
+                            from &ds.
+                            where &base_rule.
+                            group by &add_cvar.
+                            having cat_hr >= &min_hit_rate.
+                                and count(*) >= 20
+                            order by cat_hr desc
+                        )
+                        where monotonic() <= 5;
+                        %let n_hf_cats = &sqlobs.;
+                    quit;
+
+                    %do hc = 1 %to &n_hf_cats.;
+                        %let cat_rule =
+                            (&base_rule.) and
+                            &add_cvar. = "&&hf_cat&hc.";
+
+                        proc sql noprint;
+                            select
+                                count(*),
+                                sum(&target.),
+                                case when count(*) > 0
+                                    then sum(&target.) / count(*)
+                                    else 0 end,
+                                case when
+                                    (select sum(&target.) from &ds.) > 0
+                                    then sum(&target.) /
+                                        (select sum(&target.) from &ds.)
+                                    else 0 end
+                            into :mcf trimmed, :mcc trimmed,
+                                 :mch trimmed, :mcfp trimmed
+                            from &ds.
+                            where &cat_rule.;
+                        quit;
+
+                        %if %sysevalf(&mch. >= &min_hit_rate.) and
+                            %sysevalf(&mcf. >= 15) %then %do;
+
+                            %let rule_counter =
+                                %eval(&rule_counter. + 1);
+                            %let cat_vars_used =
+                                &used_vars.|&add_cvar.;
+
+                            proc sql;
+                                insert into &outds.
+                                set rule_id = &rule_counter.,
+                                    n_conditions = %eval(
+                                        %sysfunc(countw(
+                                        &cat_vars_used., |))),
+                                    rule_description = "&cat_rule.",
+                                    total_flagged = &mcf.,
+                                    fraud_flagged = &mcc.,
+                                    hit_rate = &mch.,
+                                    fraud_caught_pct = &mcfp.,
+                                    variables_used = "&cat_vars_used.";
+                            quit;
+
+                        %end; /* end if cat rule qualifies */
+                    %end; /* end hc loop (high-fraud categories) */
+                %end; /* end if cat var not already used */
+            %end; /* end cv loop (categorical variables) */
+        %end; /* end if n_char > 0 */
+
+    %end; /* end s loop (seeds) */
+
+    /* Final summary */
+    %put NOTE: =============================================;
+    %put NOTE: Multi-variable rules generated: &rule_counter.;
+    %put NOTE: =============================================;
+
+    proc freq data=&outds. noprint;
+        tables n_conditions / out=_rule_dist;
+    run;
+
+    proc print data=_rule_dist;
+        title "Multi-Variable Rules: Distribution by Complexity";
+    run;
+
+    /* Cleanup temp datasets */
+    proc datasets lib=work nolist;
+        delete _mp _mp2 _mp3 _rule_dist;
+    quit;
+
+%mend multi_variable_rules;
 
 /*=============================================================*/
 /* MAIN MACRO: FRAUD RULES ENGINE                              */
