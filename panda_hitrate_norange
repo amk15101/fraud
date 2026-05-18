@@ -1,0 +1,1508 @@
+# =============================================================================
+# FRAUD RULE GENERATION ENGINE - PANDAS VERSION
+# ONLY: var > X | var <= X | var = 'value' (NO RANGES / NO BETWEEN)
+# Supports 1, 2, 3, 4, 5 variable rules
+# =============================================================================
+
+import pandas as pd
+import numpy as np
+from itertools import combinations
+from typing import List, Dict, Optional, Tuple
+import warnings
+warnings.filterwarnings('ignore')
+
+
+# =============================================================================
+# FUNCTION 1: CATEGORICAL RULE GENERATION (PANDAS)
+# =============================================================================
+
+def generate_fraud_rules_pandas(
+    df: pd.DataFrame,
+    target_flag: str = "fraud_trans",
+    target_amt: str = "fraud_amt",
+    min_hit_rate: float = 0.10,
+    max_cardinality: int = 50,
+    min_support: int = 100,
+    max_combination_depth: int = 3,
+    exclude_patterns: Optional[List[str]] = None
+):
+    """
+    Generate categorical fraud rules from pandas DataFrame.
+    Only uses TRUE categorical variables (low cardinality).
+    Does NOT bin numeric variables into ranges.
+    Rule format: var = 'value'
+    """
+    if exclude_patterns is None:
+        exclude_patterns = [
+            'id', '_id', 'date', 'time', 'timestamp', '_dt',
+            'key', 'name', 'address', 'phone', 'email', 'ssn',
+            'account_number', 'acct_no', 'acct_num',
+            'card_number', 'card_no', 'card_num',
+            'ip_address', 'ip_addr', 'uuid'
+        ]
+
+    print("=" * 80)
+    print("FRAUD RULE GENERATION - CATEGORICAL RULES (PANDAS)")
+    print("Rule Format: var = 'value' (NO ranges, NO binning)")
+    print("=" * 80)
+
+    # Step 1: Filter columns
+    print("\n[STEP 1] Filtering columns...")
+    all_columns = [c for c in df.columns if c not in [target_flag, target_amt]]
+
+    def should_exclude(col_name: str) -> bool:
+        for pattern in exclude_patterns:
+            if pattern.lower() in col_name.lower():
+                return True
+        return False
+
+    candidate_columns = [c for c in all_columns if not should_exclude(c)]
+    print(f"  Columns after exclusion: {len(candidate_columns)}")
+
+    # Step 2: Identify categorical columns
+    print("\n[STEP 2] Identifying categorical columns...")
+    total_count = len(df)
+    total_fraud = df[target_flag].sum()
+    overall_fraud_rate = total_fraud / total_count if total_count > 0 else 0
+
+    print(f"  Total records: {total_count:,}")
+    print(f"  Total frauds: {total_fraud:,}")
+    print(f"  Overall fraud rate: {overall_fraud_rate:.4%}")
+
+    valid_columns = []
+    for col in candidate_columns:
+        n_unique = df[col].nunique()
+
+        # Numeric columns with low cardinality (flags/codes) → treat as categorical
+        if pd.api.types.is_numeric_dtype(df[col]):
+            if n_unique <= 10:
+                valid_columns.append(col)
+                print(f"    {col}: numeric, {n_unique} levels → INCLUDED (flag/code)")
+            # else: skip — handled by threshold rules
+        else:
+            # String/object columns
+            if n_unique <= max_cardinality:
+                valid_columns.append(col)
+            else:
+                print(f"    {col}: {n_unique} levels → SKIPPED (high cardinality)")
+
+    print(f"\n  Valid categorical columns: {len(valid_columns)}")
+    print(f"  Columns: {valid_columns}")
+
+    # Step 3: Single-variable rules
+    print("\n[STEP 3] Generating single-variable categorical rules...")
+    all_rules = []
+
+    for col in valid_columns:
+        grouped = df.groupby(col).agg(
+            total_count=(target_flag, 'count'),
+            fraud_count=(target_flag, 'sum'),
+            fraud_amount=(target_amt, lambda x: x[df.loc[x.index, target_flag] == 1].sum())
+        ).reset_index()
+
+        for _, row in grouped.iterrows():
+            value = row[col]
+            count = row['total_count']
+            fraud_count = row['fraud_count']
+            fraud_amount = row['fraud_amount']
+
+            if count >= min_support and count > 0:
+                hit_rate = fraud_count / count
+                if hit_rate >= min_hit_rate:
+                    all_rules.append({
+                        'rule_description': f"{col} = '{value}'",
+                        'rule_columns': col,
+                        'rule_values': str(value),
+                        'rule_type': 'categorical',
+                        'combination_depth': 1,
+                        'total_records': int(count),
+                        'fraud_count': int(fraud_count),
+                        'hit_rate': hit_rate,
+                        'fraud_amount_sum': float(fraud_amount),
+                        'avg_fraud_amount': float(fraud_amount / fraud_count) if fraud_count > 0 else 0,
+                        'lift': hit_rate / overall_fraud_rate if overall_fraud_rate > 0 else 0,
+                        'fraud_capture_rate': fraud_count / total_fraud if total_fraud > 0 else 0
+                    })
+
+    print(f"  Single-variable rules found: {len(all_rules)}")
+
+    # Step 4: Two-variable combinations
+    if max_combination_depth >= 2 and len(valid_columns) >= 2:
+        print("\n[STEP 4] Generating two-variable combination rules...")
+        two_var_rules = []
+        col_combos_2 = list(combinations(valid_columns, 2))
+        print(f"  Combinations to test: {len(col_combos_2)}")
+
+        for idx, (col1, col2) in enumerate(col_combos_2):
+            if (idx + 1) % 50 == 0:
+                print(f"    Processing {idx + 1}/{len(col_combos_2)}...")
+
+            grouped = df.groupby([col1, col2]).agg(
+                total_count=(target_flag, 'count'),
+                fraud_count=(target_flag, 'sum')
+            ).reset_index()
+
+            for _, row in grouped.iterrows():
+                count = row['total_count']
+                fraud_count = row['fraud_count']
+
+                if count >= min_support and count > 0:
+                    hit_rate = fraud_count / count
+                    if hit_rate >= min_hit_rate:
+                        two_var_rules.append({
+                            'rule_description': f"{col1} = '{row[col1]}' AND {col2} = '{row[col2]}'",
+                            'rule_columns': f"{col1} | {col2}",
+                            'rule_values': f"{row[col1]} | {row[col2]}",
+                            'rule_type': 'categorical',
+                            'combination_depth': 2,
+                            'total_records': int(count),
+                            'fraud_count': int(fraud_count),
+                            'hit_rate': hit_rate,
+                            'fraud_amount_sum': 0,
+                            'avg_fraud_amount': 0,
+                            'lift': hit_rate / overall_fraud_rate if overall_fraud_rate > 0 else 0,
+                            'fraud_capture_rate': fraud_count / total_fraud if total_fraud > 0 else 0
+                        })
+
+        all_rules.extend(two_var_rules)
+        print(f"  Two-variable rules found: {len(two_var_rules)}")
+
+    # Step 5: Three-variable combinations
+    if max_combination_depth >= 3 and len(valid_columns) >= 3:
+        print("\n[STEP 5] Generating three-variable combination rules...")
+        # Use only columns that produced single-variable rules
+        productive_cols = list(set([r['rule_columns'] for r in all_rules if r['combination_depth'] == 1]))
+        top_cols = productive_cols[:12]
+        col_combos_3 = list(combinations(top_cols, 3))
+        print(f"  Combinations to test: {len(col_combos_3)}")
+
+        three_var_rules = []
+        for idx, (col1, col2, col3) in enumerate(col_combos_3):
+            if (idx + 1) % 30 == 0:
+                print(f"    Processing {idx + 1}/{len(col_combos_3)}...")
+
+            grouped = df.groupby([col1, col2, col3]).agg(
+                total_count=(target_flag, 'count'),
+                fraud_count=(target_flag, 'sum')
+            ).reset_index()
+
+            for _, row in grouped.iterrows():
+                count = row['total_count']
+                fraud_count = row['fraud_count']
+
+                if count >= min_support and count > 0:
+                    hit_rate = fraud_count / count
+                    if hit_rate >= min_hit_rate:
+                        three_var_rules.append({
+                            'rule_description': (
+                                f"{col1} = '{row[col1]}' AND "
+                                f"{col2} = '{row[col2]}' AND "
+                                f"{col3} = '{row[col3]}'"
+                            ),
+                            'rule_columns': f"{col1} | {col2} | {col3}",
+                            'rule_values': f"{row[col1]} | {row[col2]} | {row[col3]}",
+                            'rule_type': 'categorical',
+                            'combination_depth': 3,
+                            'total_records': int(count),
+                            'fraud_count': int(fraud_count),
+                            'hit_rate': hit_rate,
+                            'fraud_amount_sum': 0,
+                            'avg_fraud_amount': 0,
+                            'lift': hit_rate / overall_fraud_rate if overall_fraud_rate > 0 else 0,
+                            'fraud_capture_rate': fraud_count / total_fraud if total_fraud > 0 else 0
+                        })
+
+        all_rules.extend(three_var_rules)
+        print(f"  Three-variable rules found: {len(three_var_rules)}")
+
+    # Compile
+    if not all_rules:
+        print("  No categorical rules found!")
+        return pd.DataFrame()
+
+    rules_df = pd.DataFrame(all_rules)
+    rules_df = rules_df.sort_values(
+        by=['hit_rate', 'fraud_count'], ascending=[False, False]
+    ).reset_index(drop=True)
+    rules_df['rule_rank'] = range(1, len(rules_df) + 1)
+
+    print(f"\n  Total categorical rules: {len(rules_df)}")
+    return rules_df
+
+
+# =============================================================================
+# FUNCTION 2: NUMERIC THRESHOLD RULES (PANDAS) - UP TO 5 VARIABLES
+# ONLY: var > X  or  var <= X  (NO RANGES)
+# =============================================================================
+
+def generate_numeric_threshold_rules_pandas(
+    df: pd.DataFrame,
+    target_flag: str = "fraud_trans",
+    target_amt: str = "fraud_amt",
+    min_hit_rate: float = 0.10,
+    min_support: int = 100,
+    exclude_patterns: Optional[List[str]] = None,
+    percentile_thresholds: List[float] = None,
+    max_variable_depth: int = 5
+):
+    """
+    Generate numeric threshold rules with up to 5 variables.
+    ONLY creates: var > X  or  var <= X
+    NEVER creates ranges/between.
+    """
+    if exclude_patterns is None:
+        exclude_patterns = [
+            'id', '_id', 'date', 'time', 'timestamp', '_dt',
+            'key', 'name', 'address', 'phone', 'email', 'ssn',
+            'account_number', 'acct_no', 'card_number',
+            'ip_address', 'uuid'
+        ]
+
+    if percentile_thresholds is None:
+        percentile_thresholds = [0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95]
+
+    print("=" * 80)
+    print("NUMERIC THRESHOLD RULE GENERATION (PANDAS)")
+    print(f"MAX VARIABLE DEPTH: {max_variable_depth}")
+    print("RULE FORMAT: var > X  or  var <= X  (NO RANGES / NO BETWEEN)")
+    print("=" * 80)
+
+    total_count = len(df)
+    total_fraud = df[target_flag].sum()
+    overall_fraud_rate = total_fraud / total_count if total_count > 0 else 0
+
+    print(f"  Total records: {total_count:,}")
+    print(f"  Total frauds: {total_fraud:,}")
+    print(f"  Overall fraud rate: {overall_fraud_rate:.4%}")
+
+    def should_exclude(col_name: str) -> bool:
+        for pattern in exclude_patterns:
+            if pattern.lower() in col_name.lower():
+                return True
+        return False
+
+    # Get numeric columns
+    numeric_columns = []
+    for col in df.columns:
+        if col in [target_flag, target_amt]:
+            continue
+        if should_exclude(col):
+            continue
+        if pd.api.types.is_numeric_dtype(df[col]):
+            if df[col].nunique() > 10:  # Skip low-cardinality (handled as categorical)
+                numeric_columns.append(col)
+
+    print(f"\n  Numeric columns: {len(numeric_columns)}")
+    print(f"  Columns: {numeric_columns}")
+
+    # =========================================================================
+    # HELPER: Test a rule condition and return stats
+    # =========================================================================
+    def test_rule_condition(mask: pd.Series, min_obs: int = 100) -> Optional[Dict]:
+        """Test a boolean mask against the data. Returns stats if qualifies."""
+        count = mask.sum()
+        if count < min_obs or count == 0:
+            return None
+
+        fraud_count = df.loc[mask, target_flag].sum()
+        hit_rate = fraud_count / count
+
+        if hit_rate < min_hit_rate:
+            return None
+
+        fraud_amount = df.loc[mask & (df[target_flag] == 1), target_amt].sum()
+
+        return {
+            'total_records': int(count),
+            'fraud_count': int(fraud_count),
+            'hit_rate': hit_rate,
+            'fraud_amount_sum': float(fraud_amount),
+            'avg_fraud_amount': float(fraud_amount / fraud_count) if fraud_count > 0 else 0,
+            'lift': hit_rate / overall_fraud_rate if overall_fraud_rate > 0 else 0,
+            'fraud_capture_rate': fraud_count / total_fraud if total_fraud > 0 else 0
+        }
+
+    # =========================================================================
+    # HELPER: Parse rule description into a pandas boolean mask
+    # =========================================================================
+    def rule_to_mask(rule_desc: str) -> pd.Series:
+        """Convert rule description string to pandas boolean mask."""
+        parts = rule_desc.split(' AND ')
+        mask = pd.Series([True] * len(df), index=df.index)
+
+        for part in parts:
+            part = part.strip()
+            if ' > ' in part:
+                col, val = part.split(' > ', 1)
+                mask = mask & (df[col.strip()] > float(val.strip()))
+            elif ' <= ' in part:
+                col, val = part.split(' <= ', 1)
+                mask = mask & (df[col.strip()] <= float(val.strip()))
+
+        return mask
+
+    # =========================================================================
+    # HELPER: Get columns used in a rule
+    # =========================================================================
+    def get_rule_columns(rule_desc: str) -> set:
+        """Extract column names from rule description."""
+        parts = rule_desc.split(' AND ')
+        cols = set()
+        for part in parts:
+            part = part.strip()
+            if ' > ' in part:
+                cols.add(part.split(' > ', 1)[0].strip())
+            elif ' <= ' in part:
+                cols.add(part.split(' <= ', 1)[0].strip())
+        return cols
+
+    # =========================================================================
+    # PRE-COMPUTE: Percentiles for all numeric columns
+    # =========================================================================
+    print("\n  Pre-computing percentiles...")
+    column_percentiles = {}
+    for col in numeric_columns:
+        try:
+            values = df[col].dropna()
+            if len(values) == 0:
+                continue
+            percentiles = np.percentile(values, [p * 100 for p in percentile_thresholds])
+
+            # Deduplicate
+            seen = set()
+            unique = []
+            for pct, val in zip(percentile_thresholds, percentiles):
+                val_rounded = round(float(val), 4)
+                if val_rounded not in seen:
+                    seen.add(val_rounded)
+                    unique.append((pct, val_rounded))
+            column_percentiles[col] = unique
+        except Exception as e:
+            print(f"    Warning: {col}: {e}")
+            continue
+
+    print(f"  Percentiles computed for {len(column_percentiles)} columns")
+
+    # =========================================================================
+    # PHASE 1: 1-VARIABLE RULES
+    # =========================================================================
+    print("\n" + "-" * 60)
+    print("  PHASE 1: Building 1-variable rules...")
+    print("  Format: var > X  or  var <= X")
+    print("-" * 60)
+
+    all_rules = []
+
+    for col in numeric_columns:
+        if col not in column_percentiles:
+            continue
+
+        for pct, threshold in column_percentiles[col]:
+            # Test: var > threshold
+            mask_gt = df[col] > threshold
+            result = test_rule_condition(mask_gt, min_obs=min_support)
+            if result:
+                all_rules.append({
+                    'rule_description': f"{col} > {threshold}",
+                    'rule_columns': col,
+                    'rule_type': 'greater_than',
+                    'threshold_value': threshold,
+                    'percentile': pct,
+                    'combination_depth': 1,
+                    **result
+                })
+
+            # Test: var <= threshold
+            mask_le = df[col] <= threshold
+            result = test_rule_condition(mask_le, min_obs=min_support)
+            if result:
+                all_rules.append({
+                    'rule_description': f"{col} <= {threshold}",
+                    'rule_columns': col,
+                    'rule_type': 'less_than_equal',
+                    'threshold_value': threshold,
+                    'percentile': pct,
+                    'combination_depth': 1,
+                    **result
+                })
+
+    print(f"  1-variable rules found: {len(all_rules)}")
+
+    # =========================================================================
+    # PHASE 2: 2-VARIABLE RULES
+    # =========================================================================
+    two_var_rules = []
+    if max_variable_depth >= 2 and all_rules:
+        print("\n" + "-" * 60)
+        print("  PHASE 2: Building 2-variable rules...")
+        print("  Format: var1 > X AND var2 <= Y")
+        print("-" * 60)
+
+        # Take top single rules as seeds
+        sorted_1var = sorted(all_rules, key=lambda x: x['hit_rate'], reverse=True)
+        top_1var = sorted_1var[:15]
+
+        for i in range(len(top_1var)):
+            for j in range(i + 1, len(top_1var)):
+                rule_i = top_1var[i]
+                rule_j = top_1var[j]
+
+                # Skip if same column
+                if rule_i['rule_columns'] == rule_j['rule_columns']:
+                    continue
+
+                rule_desc = f"{rule_i['rule_description']} AND {rule_j['rule_description']}"
+
+                try:
+                    mask = rule_to_mask(rule_desc)
+                    result = test_rule_condition(mask, min_obs=min_support)
+                    if result:
+                        cols_used = f"{rule_i['rule_columns']} | {rule_j['rule_columns']}"
+                        two_var_rules.append({
+                            'rule_description': rule_desc,
+                            'rule_columns': cols_used,
+                            'rule_type': 'multi_threshold',
+                            'threshold_value': None,
+                            'percentile': None,
+                            'combination_depth': 2,
+                            **result
+                        })
+                except Exception:
+                    continue
+
+        all_rules.extend(two_var_rules)
+        print(f"  2-variable rules found: {len(two_var_rules)}")
+
+    # =========================================================================
+    # PHASE 3: 3-VARIABLE RULES
+    # =========================================================================
+    three_var_rules = []
+    if max_variable_depth >= 3 and two_var_rules:
+        print("\n" + "-" * 60)
+        print("  PHASE 3: Building 3-variable rules...")
+        print("  Format: var1 > X AND var2 <= Y AND var3 > Z")
+        print("-" * 60)
+
+        # Take top 2-var rules as seeds
+        sorted_2var = sorted(two_var_rules,
+                             key=lambda x: x['hit_rate'] * x['fraud_capture_rate'],
+                             reverse=True)
+        top_2var = sorted_2var[:10]
+
+        # Take top 1-var rules to add
+        top_1var_for_add = sorted_1var[:12]
+
+        for combo_rule in top_2var:
+            used_cols = get_rule_columns(combo_rule['rule_description'])
+
+            for single_rule in top_1var_for_add:
+                add_col = single_rule['rule_columns']
+                if add_col in used_cols:
+                    continue
+
+                rule_desc = f"{combo_rule['rule_description']} AND {single_rule['rule_description']}"
+
+                try:
+                    mask = rule_to_mask(rule_desc)
+                    result = test_rule_condition(mask, min_obs=max(min_support // 2, 50))
+                    if result:
+                        all_cols = used_cols | {add_col}
+                        three_var_rules.append({
+                            'rule_description': rule_desc,
+                            'rule_columns': ' | '.join(sorted(all_cols)),
+                            'rule_type': 'multi_threshold',
+                            'threshold_value': None,
+                            'percentile': None,
+                            'combination_depth': 3,
+                            **result
+                        })
+                except Exception:
+                    continue
+
+        all_rules.extend(three_var_rules)
+        print(f"  3-variable rules found: {len(three_var_rules)}")
+
+    # =========================================================================
+    # PHASE 4: 4-VARIABLE RULES
+    # =========================================================================
+    four_var_rules = []
+    if max_variable_depth >= 4 and three_var_rules:
+        print("\n" + "-" * 60)
+        print("  PHASE 4: Building 4-variable rules...")
+        print("  Format: var1 > X AND var2 <= Y AND var3 > Z AND var4 > W")
+        print("-" * 60)
+
+        # Take top 3-var rules as seeds
+        sorted_3var = sorted(three_var_rules,
+                             key=lambda x: x['hit_rate'] * x['fraud_capture_rate'],
+                             reverse=True)
+        top_3var = sorted_3var[:8]
+
+        # Take top 1-var rules to add
+        top_1var_for_add = sorted_1var[:10]
+
+        for combo_rule in top_3var:
+            used_cols = get_rule_columns(combo_rule['rule_description'])
+
+            for single_rule in top_1var_for_add:
+                add_col = single_rule['rule_columns']
+                if add_col in used_cols:
+                    continue
+
+                rule_desc = f"{combo_rule['rule_description']} AND {single_rule['rule_description']}"
+
+                try:
+                    mask = rule_to_mask(rule_desc)
+                    result = test_rule_condition(mask, min_obs=max(min_support // 4, 20))
+                    if result:
+                        all_cols = used_cols | {add_col}
+                        four_var_rules.append({
+                            'rule_description': rule_desc,
+                            'rule_columns': ' | '.join(sorted(all_cols)),
+                            'rule_type': 'multi_threshold',
+                            'threshold_value': None,
+                            'percentile': None,
+                            'combination_depth': 4,
+                            **result
+                        })
+                except Exception:
+                    continue
+
+        all_rules.extend(four_var_rules)
+        print(f"  4-variable rules found: {len(four_var_rules)}")
+
+    # =========================================================================
+    # PHASE 5: 5-VARIABLE RULES
+    # =========================================================================
+    five_var_rules = []
+    if max_variable_depth >= 5 and four_var_rules:
+        print("\n" + "-" * 60)
+        print("  PHASE 5: Building 5-variable rules...")
+        print("  Format: var1 > X AND var2 <= Y AND var3 > Z AND var4 > W AND var5 <= V")
+        print("-" * 60)
+
+        # Take top 4-var rules as seeds
+        sorted_4var = sorted(four_var_rules,
+                             key=lambda x: x['hit_rate'] * x['fraud_capture_rate'],
+                             reverse=True)
+        top_4var = sorted_4var[:5]
+
+        # Take top 1-var rules to add
+        top_1var_for_add = sorted_1var[:8]
+
+        for combo_rule in top_4var:
+            used_cols = get_rule_columns(combo_rule['rule_description'])
+
+            for single_rule in top_1var_for_add:
+                add_col = single_rule['rule_columns']
+                if add_col in used_cols:
+                    continue
+
+                rule_desc = f"{combo_rule['rule_description']} AND {single_rule['rule_description']}"
+
+                try:
+                    mask = rule_to_mask(rule_desc)
+                    result = test_rule_condition(mask, min_obs=max(min_support // 8, 10))
+                    if result:
+                        all_cols = used_cols | {add_col}
+                        five_var_rules.append({
+                            'rule_description': rule_desc,
+                            'rule_columns': ' | '.join(sorted(all_cols)),
+                            'rule_type': 'multi_threshold',
+                            'threshold_value': None,
+                            'percentile': None,
+                            'combination_depth': 5,
+                            **result
+                        })
+                except Exception:
+                    continue
+
+        all_rules.extend(five_var_rules)
+        print(f"  5-variable rules found: {len(five_var_rules)}")
+
+    # =========================================================================
+    # COMPILE RESULTS
+    # =========================================================================
+    if not all_rules:
+        print("\n  No threshold rules found!")
+        return pd.DataFrame()
+
+    rules_df = pd.DataFrame(all_rules)
+    rules_df = rules_df.sort_values(
+        by=['hit_rate', 'fraud_count'], ascending=[False, False]
+    ).reset_index(drop=True)
+    rules_df['rule_rank'] = range(1, len(rules_df) + 1)
+    rules_df['hit_rate_pct'] = rules_df['hit_rate'].apply(lambda x: f"{x:.2%}")
+    rules_df['fraud_capture_rate_pct'] = rules_df['fraud_capture_rate'].apply(lambda x: f"{x:.2%}")
+
+    print(f"\n{'=' * 80}")
+    print(f"NUMERIC THRESHOLD RULES SUMMARY")
+    print(f"ALL RULES: var > X  or  var <= X  (NO RANGES)")
+    print(f"{'=' * 80}")
+    print(f"  Total rules: {len(rules_df)}")
+    print(f"  1-variable: {len(rules_df[rules_df['combination_depth'] == 1])}")
+    print(f"  2-variable: {len(rules_df[rules_df['combination_depth'] == 2])}")
+    print(f"  3-variable: {len(rules_df[rules_df['combination_depth'] == 3])}")
+    print(f"  4-variable: {len(rules_df[rules_df['combination_depth'] == 4])}")
+    print(f"  5-variable: {len(rules_df[rules_df['combination_depth'] == 5])}")
+    print(f"  Max hit rate: {rules_df['hit_rate'].max():.2%}")
+    print(f"  Max lift: {rules_df['lift'].max():.2f}x")
+
+    print(f"\n  Top 15 Rules:")
+    print(f"  {'-' * 80}")
+    for _, row in rules_df.head(15).iterrows():
+        print(f"  #{row['rule_rank']:3d} | Hit Rate: {row['hit_rate_pct']:>7s} | "
+              f"Fraud: {row['fraud_count']:>6,} | Records: {row['total_records']:>8,} | "
+              f"Lift: {row['lift']:.1f}x | Vars: {row['combination_depth']}")
+        print(f"       | Rule: {row['rule_description'][:75]}")
+        print(f"  {'-' * 80}")
+
+    return rules_df
+
+
+# =============================================================================
+# FUNCTION 3: COMBINE AND RANK ALL RULES (PANDAS)
+# =============================================================================
+
+def combine_and_rank_all_rules_pandas(
+    categorical_rules: pd.DataFrame,
+    threshold_rules: pd.DataFrame,
+    remove_redundant: bool = True
+):
+    """Combine categorical and threshold rules, rank by composite score."""
+    print("=" * 80)
+    print("COMBINING AND RANKING ALL RULES (PANDAS)")
+    print("Rule formats: var = 'value', var > X, var <= X (NO RANGES)")
+    print("=" * 80)
+
+    # Standardize columns
+    common_cols = [
+        'rule_description', 'rule_columns', 'rule_type', 'combination_depth',
+        'total_records', 'fraud_count', 'hit_rate', 'fraud_amount_sum',
+        'lift', 'fraud_capture_rate'
+    ]
+
+    cat_cols = [c for c in common_cols if c in categorical_rules.columns]
+    thr_cols = [c for c in common_cols if c in threshold_rules.columns]
+
+    combined = pd.concat([
+        categorical_rules[cat_cols],
+        threshold_rules[thr_cols]
+    ], ignore_index=True)
+
+    # Composite score
+    combined['composite_score'] = (
+        combined['hit_rate'] * np.log1p(combined['fraud_count']) * combined['lift']
+    )
+
+    combined = combined.sort_values(
+        by=['composite_score', 'hit_rate', 'fraud_count'],
+        ascending=[False, False, False]
+    ).reset_index(drop=True)
+
+    combined['final_rank'] = range(1, len(combined) + 1)
+    combined['hit_rate_pct'] = combined['hit_rate'].apply(lambda x: f"{x:.2%}")
+    combined['fraud_capture_pct'] = combined['fraud_capture_rate'].apply(lambda x: f"{x:.2%}")
+
+    # Remove redundant
+    if remove_redundant:
+        before = len(combined)
+        combined = combined.drop_duplicates(subset=['rule_description'], keep='first')
+        combined = combined.reset_index(drop=True)
+        combined['final_rank'] = range(1, len(combined) + 1)
+        print(f"  Removed {before - len(combined)} redundant rules")
+
+    # Remove any range rules (safety check)
+    combined = combined[combined['rule_type'] != 'range'].reset_index(drop=True)
+    combined['final_rank'] = range(1, len(combined) + 1)
+
+    print(f"\n  FINAL RULE COUNT: {len(combined)}")
+    print(f"  Rule types: {combined['rule_type'].value_counts().to_dict()}")
+
+    print(f"\n  Top 20 Rules:")
+    print(f"  {'=' * 80}")
+    for _, row in combined.head(20).iterrows():
+        print(f"  #{row['final_rank']:3d} | Hit Rate: {row['hit_rate_pct']:>7s} | "
+              f"Lift: {row['lift']:>5.1f}x | Fraud: {row['fraud_count']:>6,} | "
+              f"Type: {row['rule_type']}")
+        print(f"       | {row['rule_description'][:72]}")
+        print(f"  {'-' * 80}")
+
+    return combined
+
+
+# =============================================================================
+# FUNCTION 4: APPLY RULES TO DATAFRAME (PANDAS)
+# =============================================================================
+
+def apply_rules_to_dataframe_pandas(
+    df: pd.DataFrame,
+    rules_df: pd.DataFrame,
+    target_flag: str = "fraud_trans",
+    top_n_rules: int = None
+):
+    """Apply rules to flag transactions. Only supports =, >, <= (NO ranges)."""
+    print("=" * 80)
+    print("APPLYING RULES TO DATAFRAME (PANDAS)")
+    print("=" * 80)
+
+    if top_n_rules:
+        rules_to_apply = rules_df.head(top_n_rules)
+    else:
+        rules_to_apply = rules_df
+
+    result_df = df.copy()
+    rule_columns = []
+
+    for idx, row in rules_to_apply.iterrows():
+        rule_rank = row.get('final_rank', row.get('rule_rank', idx + 1))
+        rule_col = f"RULE_{rule_rank}"
+        rule_columns.append(rule_col)
+
+        rule_desc = row['rule_description']
+        rule_type = row.get('rule_type', 'categorical')
+
+        try:
+            if rule_type == 'categorical':
+                # Parse: "col1 = 'val1' AND col2 = 'val2'"
+                parts = rule_desc.split(' AND ')
+                mask = pd.Series([True] * len(df), index=df.index)
+                for part in parts:
+                    part = part.strip()
+                    if " = " in part:
+                        col_part, val_part = part.split(" = ", 1)
+                        col_part = col_part.strip()
+                        val_part = val_part.strip().strip("'")
+                        if val_part == 'None' or val_part == 'null':
+                            mask = mask & df[col_part].isna()
+                        else:
+                            try:
+                                numeric_val = float(val_part)
+                                mask = mask & (df[col_part] == numeric_val)
+                            except (ValueError, TypeError):
+                                mask = mask & (df[col_part].astype(str) == val_part)
+
+            elif rule_type in ('greater_than', 'less_than_equal', 'multi_threshold'):
+                # Parse: "col > X AND col2 <= Y"
+                parts = rule_desc.split(' AND ')
+                mask = pd.Series([True] * len(df), index=df.index)
+                for part in parts:
+                    part = part.strip()
+                    if ' > ' in part:
+                        col_part, val_part = part.split(' > ', 1)
+                        mask = mask & (df[col_part.strip()] > float(val_part.strip()))
+                    elif ' <= ' in part:
+                        col_part, val_part = part.split(' <= ', 1)
+                        mask = mask & (df[col_part.strip()] <= float(val_part.strip()))
+                    elif " = " in part:
+                        col_part, val_part = part.split(" = ", 1)
+                        val_part = val_part.strip().strip("'")
+                        mask = mask & (df[col_part.strip()].astype(str) == val_part)
+            else:
+                mask = pd.Series([False] * len(df), index=df.index)
+
+            result_df[rule_col] = mask.astype(int)
+
+        except Exception as e:
+            print(f"  Warning: Could not apply rule {rule_rank}: {e}")
+            result_df[rule_col] = 0
+
+    # Combined flags
+    result_df['ANY_RULE_TRIGGERED'] = result_df[rule_columns].max(axis=1)
+    result_df['NUM_RULES_TRIGGERED'] = result_df[rule_columns].sum(axis=1)
+
+    # Performance
+    total = len(result_df)
+    total_fraud = result_df[target_flag].sum()
+    triggered = result_df[result_df['ANY_RULE_TRIGGERED'] == 1]
+    triggered_count = len(triggered)
+    triggered_fraud = triggered[target_flag].sum()
+
+    print(f"\n  Total records: {total:,}")
+    print(f"  Records flagged: {triggered_count:,} ({triggered_count/total:.2%})")
+    print(f"  Fraud captured: {triggered_fraud:,} / {total_fraud:,} ({triggered_fraud/total_fraud:.2%})")
+    if triggered_count > 0:
+        print(f"  Precision (hit rate): {triggered_fraud/triggered_count:.2%}")
+
+    return result_df
+
+
+# =============================================================================
+# FUNCTION 5: GREEDY RULE SELECTION / OVERLAP ANALYSIS (PANDAS)
+# =============================================================================
+
+def greedy_rule_selection_pandas(
+    df: pd.DataFrame,
+    rules_df: pd.DataFrame,
+    target_flag: str = "fraud_trans",
+    top_n_rules: int = 20,
+    max_selected: int = 15
+):
+    """
+    Greedy selection of non-redundant rules that maximize fraud coverage.
+    Each iteration picks the rule with highest marginal fraud gain.
+    """
+    print("=" * 80)
+    print("GREEDY RULE SELECTION & OVERLAP ANALYSIS (PANDAS)")
+    print("=" * 80)
+    print("GREEDY RULE SELECTION & OVERLAP ANALYSIS (PANDAS)")
+    print("=" * 80)
+
+    total_fraud = df[target_flag].sum()
+    top_rules = rules_df.head(top_n_rules)
+
+    print(f"  Total fraud in dataset: {total_fraud:,}")
+    print(f"  Candidate rules to evaluate: {len(top_rules)}")
+
+    # Pre-compute fraud masks for each rule
+    rule_fraud_masks = {}
+
+    for idx, row in top_rules.iterrows():
+        rule_rank = row.get('final_rank', row.get('rule_rank', idx + 1))
+        rule_desc = row['rule_description']
+        rule_type = row.get('rule_type', 'categorical')
+
+        try:
+            if rule_type == 'categorical':
+                parts = rule_desc.split(' AND ')
+                mask = pd.Series([True] * len(df), index=df.index)
+                for part in parts:
+                    part = part.strip()
+                    if " = " in part:
+                        col_part, val_part = part.split(" = ", 1)
+                        col_part = col_part.strip()
+                        val_part = val_part.strip().strip("'")
+                        if val_part == 'None' or val_part == 'null':
+                            mask = mask & df[col_part].isna()
+                        else:
+                            try:
+                                numeric_val = float(val_part)
+                                mask = mask & (df[col_part] == numeric_val)
+                            except (ValueError, TypeError):
+                                mask = mask & (df[col_part].astype(str) == val_part)
+
+            elif rule_type in ('greater_than', 'less_than_equal', 'multi_threshold'):
+                parts = rule_desc.split(' AND ')
+                mask = pd.Series([True] * len(df), index=df.index)
+                for part in parts:
+                    part = part.strip()
+                    if ' > ' in part:
+                        col_part, val_part = part.split(' > ', 1)
+                        mask = mask & (df[col_part.strip()] > float(val_part.strip()))
+                    elif ' <= ' in part:
+                        col_part, val_part = part.split(' <= ', 1)
+                        mask = mask & (df[col_part.strip()] <= float(val_part.strip()))
+                    elif " = " in part:
+                        col_part, val_part = part.split(" = ", 1)
+                        val_part = val_part.strip().strip("'")
+                        mask = mask & (df[col_part.strip()].astype(str) == val_part)
+            else:
+                mask = pd.Series([False] * len(df), index=df.index)
+
+            # Get fraud indices caught by this rule
+            fraud_mask = mask & (df[target_flag] == 1)
+            rule_fraud_masks[idx] = set(df.index[fraud_mask])
+
+        except Exception as e:
+            print(f"  Warning: Could not parse rule {rule_rank}: {e}")
+            rule_fraud_masks[idx] = set()
+
+    # Greedy selection
+    print("\n  Running greedy selection...")
+    optimal_rules = []
+    remaining_rule_indices = list(rule_fraud_masks.keys())
+    cumulative_fraud_captured = set()
+
+    for iteration in range(min(max_selected, len(remaining_rule_indices))):
+        best_rule_idx = None
+        best_marginal_gain = 0
+
+        for rule_idx in remaining_rule_indices:
+            marginal_gain = len(rule_fraud_masks[rule_idx] - cumulative_fraud_captured)
+            if marginal_gain > best_marginal_gain:
+                best_marginal_gain = marginal_gain
+                best_rule_idx = rule_idx
+
+        if best_rule_idx is None or best_marginal_gain == 0:
+            print(f"  Stopping at iteration {iteration + 1}: no more marginal gain")
+            break
+
+        cumulative_fraud_captured.update(rule_fraud_masks[best_rule_idx])
+        remaining_rule_indices.remove(best_rule_idx)
+
+        rule_row = top_rules.loc[best_rule_idx]
+        rule_total_flagged = len(rule_fraud_masks[best_rule_idx])
+
+        # Calculate hit rate for this rule
+        rule_desc = rule_row['rule_description']
+        rule_type = rule_row.get('rule_type', 'categorical')
+        try:
+            if rule_type == 'categorical':
+                parts = rule_desc.split(' AND ')
+                rmask = pd.Series([True] * len(df), index=df.index)
+                for part in parts:
+                    part = part.strip()
+                    if " = " in part:
+                        col_part, val_part = part.split(" = ", 1)
+                        col_part = col_part.strip()
+                        val_part = val_part.strip().strip("'")
+                        try:
+                            rmask = rmask & (df[col_part] == float(val_part))
+                        except:
+                            rmask = rmask & (df[col_part].astype(str) == val_part)
+            else:
+                parts = rule_desc.split(' AND ')
+                rmask = pd.Series([True] * len(df), index=df.index)
+                for part in parts:
+                    part = part.strip()
+                    if ' > ' in part:
+                        col_part, val_part = part.split(' > ', 1)
+                        rmask = rmask & (df[col_part.strip()] > float(val_part.strip()))
+                    elif ' <= ' in part:
+                        col_part, val_part = part.split(' <= ', 1)
+                        rmask = rmask & (df[col_part.strip()] <= float(val_part.strip()))
+
+            total_flagged_by_rule = rmask.sum()
+        except:
+            total_flagged_by_rule = rule_row.get('total_records', 0)
+
+        optimal_rules.append({
+            'iteration': iteration + 1,
+            'rule_rank': rule_row.get('final_rank', rule_row.get('rule_rank', best_rule_idx)),
+            'rule_description': rule_row['rule_description'],
+            'rule_type': rule_row.get('rule_type', 'unknown'),
+            'combination_depth': rule_row.get('combination_depth', 1),
+            'hit_rate': rule_row['hit_rate'],
+            'total_flagged': int(total_flagged_by_rule),
+            'marginal_fraud_captured': best_marginal_gain,
+            'cumulative_fraud_captured': len(cumulative_fraud_captured),
+            'cumulative_capture_rate': len(cumulative_fraud_captured) / total_fraud if total_fraud > 0 else 0
+        })
+
+    optimal_df = pd.DataFrame(optimal_rules)
+
+    # Print results
+    print(f"\n  {'=' * 80}")
+    print(f"  OPTIMAL NON-REDUNDANT RULE SET")
+    print(f"  All rules: var > X, var <= X, or var = 'value' (NO RANGES)")
+    print(f"  {'=' * 80}")
+
+    for _, row in optimal_df.iterrows():
+        print(f"  #{row['iteration']:2d} | +{row['marginal_fraud_captured']:>5,} fraud | "
+              f"Cumulative: {row['cumulative_capture_rate']:.2%} | "
+              f"Hit Rate: {row['hit_rate']:.2%} | "
+              f"Vars: {row['combination_depth']} | "
+              f"Type: {row['rule_type']}")
+        print(f"       | {row['rule_description'][:68]}")
+        print(f"  {'-' * 80}")
+
+    if len(optimal_df) > 0:
+        print(f"\n  SUMMARY:")
+        print(f"  Rules selected: {len(optimal_df)}")
+        print(f"  Total fraud captured: {optimal_df['cumulative_fraud_captured'].max():,} / {total_fraud:,}")
+        print(f"  Capture rate: {optimal_df['cumulative_capture_rate'].max():.2%}")
+
+    return optimal_df
+
+
+# =============================================================================
+# FUNCTION 6: EXPORT RULES AS PYTHON CONDITIONS
+# =============================================================================
+
+def export_rules_as_python_conditions(
+    rules_df: pd.DataFrame,
+    top_n: int = 30,
+    df_variable_name: str = "df"
+):
+    """Export rules as copy-paste ready Python/Pandas conditions."""
+    print("=" * 80)
+    print("EXPORTING RULES AS PYTHON/PANDAS CONDITIONS")
+    print("Format: var > X, var <= X, var = 'value' (NO RANGES)")
+    print("=" * 80)
+
+    top_rules = rules_df.head(top_n)
+    python_conditions = []
+
+    for idx, row in top_rules.iterrows():
+        rule_desc = row['rule_description']
+        rule_type = row.get('rule_type', 'categorical')
+        rule_rank = row.get('final_rank', row.get('rule_rank', idx + 1))
+
+        conditions = []
+        parts = rule_desc.split(' AND ')
+
+        for part in parts:
+            part = part.strip()
+            if ' > ' in part:
+                col, val = part.split(' > ', 1)
+                conditions.append(f"({df_variable_name}['{col.strip()}'] > {float(val.strip())})")
+            elif ' <= ' in part:
+                col, val = part.split(' <= ', 1)
+                conditions.append(f"({df_variable_name}['{col.strip()}'] <= {float(val.strip())})")
+            elif " = " in part:
+                col, val = part.split(" = ", 1)
+                col = col.strip()
+                val = val.strip().strip("'")
+                try:
+                    float(val)
+                    conditions.append(f"({df_variable_name}['{col}'] == {val})")
+                except (ValueError, TypeError):
+                    conditions.append(f"({df_variable_name}['{col}'] == '{val}')")
+
+        condition_str = " & ".join(conditions)
+
+        python_conditions.append({
+            'rule_rank': rule_rank,
+            'rule_description': rule_desc,
+            'rule_type': rule_type,
+            'hit_rate': row['hit_rate'],
+            'fraud_count': row['fraud_count'],
+            'lift': row['lift'],
+            'python_condition': condition_str
+        })
+
+    # Print copy-paste ready code
+    print("\n# ============ COPY-PASTE READY PYTHON CODE ============")
+    print("# ALL RULES: var > X, var <= X, or var = 'value' (NO RANGES)\n")
+
+    for rule in python_conditions[:20]:
+        print(f"# Rule #{rule['rule_rank']}: Hit Rate={rule['hit_rate']:.2%}, "
+              f"Lift={rule['lift']:.1f}x, Type={rule['rule_type']}")
+        print(f"# {rule['rule_description']}")
+        print(f"{df_variable_name}['RULE_{rule['rule_rank']}_FLAG'] = (")
+        print(f"    {rule['python_condition']}")
+        print(f").astype(int)\n")
+
+    return python_conditions
+
+
+# =============================================================================
+# FUNCTION 7: MASTER PIPELINE (PANDAS)
+# =============================================================================
+
+def run_full_rule_generation_pipeline_pandas(
+    df: pd.DataFrame,
+    target_flag: str = "fraud_trans",
+    target_amt: str = "fraud_amt",
+    min_hit_rate: float = 0.10,
+    min_support: int = 100,
+    max_combination_depth: int = 3,
+    max_cardinality: int = 50,
+    max_variable_depth: int = 5,
+    exclude_patterns: Optional[List[str]] = None,
+    export_path: Optional[str] = None
+):
+    """
+    Master pipeline for fraud rule generation using Pandas.
+
+    ALL RULES GENERATED ARE IN FORMAT:
+        - var > X (numeric, greater than threshold)
+        - var <= X (numeric, less than or equal to threshold)
+        - var = 'value' (categorical, exact match)
+
+    NEVER GENERATES:
+        - var BETWEEN X AND Y
+        - X < var < Y
+        - Binned ranges
+    """
+    print("\n" + "#" * 80)
+    print("#" + " " * 10 + "FRAUD RULE GENERATION PIPELINE (PANDAS)" + " " * 12 + "#")
+    print("#" + " " * 10 + "RULE FORMAT: var > X | var <= X | var = 'val'" + " " * 7 + "#")
+    print("#" + " " * 10 + f"MAX VARIABLE DEPTH: {max_variable_depth}" + " " * 30 + "#")
+    print("#" + " " * 10 + "NO RANGES / NO BETWEEN / NO BINNING" + " " * 16 + "#")
+    print("#" * 80 + "\n")
+
+    results = {}
+
+    # =========================================================================
+    # PHASE 1: CATEGORICAL RULES
+    # =========================================================================
+    print("\n" + "~" * 80)
+    print("PHASE 1: CATEGORICAL RULES (var = 'value')")
+    print("~" * 80)
+
+    categorical_rules = generate_fraud_rules_pandas(
+        df=df,
+        target_flag=target_flag,
+        target_amt=target_amt,
+        min_hit_rate=min_hit_rate,
+        max_cardinality=max_cardinality,
+        min_support=min_support,
+        max_combination_depth=max_combination_depth,
+        exclude_patterns=exclude_patterns
+    )
+    results['categorical_rules'] = categorical_rules
+
+    # =========================================================================
+    # PHASE 2: NUMERIC THRESHOLD RULES (1-5 variables)
+    # =========================================================================
+    print("\n" + "~" * 80)
+    print(f"PHASE 2: NUMERIC THRESHOLD RULES (up to {max_variable_depth} variables)")
+    print("~" * 80)
+
+    threshold_rules = generate_numeric_threshold_rules_pandas(
+        df=df,
+        target_flag=target_flag,
+        target_amt=target_amt,
+        min_hit_rate=min_hit_rate,
+        min_support=min_support,
+        exclude_patterns=exclude_patterns,
+        max_variable_depth=max_variable_depth
+    )
+    results['threshold_rules'] = threshold_rules
+
+    # =========================================================================
+    # PHASE 3: COMBINE & RANK
+    # =========================================================================
+    print("\n" + "~" * 80)
+    print("PHASE 3: COMBINE & RANK ALL RULES")
+    print("~" * 80)
+
+    if len(categorical_rules) > 0 and len(threshold_rules) > 0:
+        combined_rules = combine_and_rank_all_rules_pandas(
+            categorical_rules=categorical_rules,
+            threshold_rules=threshold_rules,
+            remove_redundant=True
+        )
+    elif len(categorical_rules) > 0:
+        combined_rules = categorical_rules.copy()
+        combined_rules['final_rank'] = range(1, len(combined_rules) + 1)
+        combined_rules['composite_score'] = (
+            combined_rules['hit_rate'] * np.log1p(combined_rules['fraud_count']) * combined_rules['lift']
+        )
+    elif len(threshold_rules) > 0:
+        combined_rules = threshold_rules.copy()
+        combined_rules['final_rank'] = range(1, len(combined_rules) + 1)
+        combined_rules['composite_score'] = (
+            combined_rules['hit_rate'] * np.log1p(combined_rules['fraud_count']) * combined_rules['lift']
+        )
+    else:
+        combined_rules = pd.DataFrame()
+        print("  WARNING: No rules found!")
+
+    results['combined_rules'] = combined_rules
+
+    # =========================================================================
+    # PHASE 4: GREEDY RULE SELECTION
+    # =========================================================================
+    if len(combined_rules) > 0:
+        print("\n" + "~" * 80)
+        print("PHASE 4: GREEDY RULE SELECTION (Non-redundant optimal set)")
+        print("~" * 80)
+
+        optimal_set = greedy_rule_selection_pandas(
+            df=df,
+            rules_df=combined_rules,
+            target_flag=target_flag,
+            top_n_rules=min(30, len(combined_rules)),
+            max_selected=15
+        )
+        results['optimal_rule_set'] = optimal_set
+
+    # =========================================================================
+    # PHASE 5: EXPORT PYTHON CONDITIONS
+    # =========================================================================
+    if len(combined_rules) > 0:
+        print("\n" + "~" * 80)
+        print("PHASE 5: EXPORT PYTHON CONDITIONS")
+        print("~" * 80)
+
+        python_conditions = export_rules_as_python_conditions(
+            rules_df=combined_rules,
+            top_n=30,
+            df_variable_name="df"
+        )
+        results['python_conditions'] = python_conditions
+
+    # =========================================================================
+    # PHASE 6: EXPORT TO FILE
+    # =========================================================================
+    if export_path and len(combined_rules) > 0:
+        print("\n" + "~" * 80)
+        print("PHASE 6: EXPORTING RESULTS")
+        print("~" * 80)
+        try:
+            combined_rules.to_csv(f"{export_path}/fraud_rules_combined.csv", index=False)
+            print(f"  Exported combined rules to: {export_path}/fraud_rules_combined.csv")
+
+            if 'optimal_rule_set' in results and len(results['optimal_rule_set']) > 0:
+                results['optimal_rule_set'].to_csv(
+                    f"{export_path}/fraud_rules_optimal.csv", index=False
+                )
+                print(f"  Exported optimal rules to: {export_path}/fraud_rules_optimal.csv")
+        except Exception as e:
+            print(f"  WARNING: Export failed: {e}")
+
+    # =========================================================================
+    # FINAL SUMMARY
+    # =========================================================================
+    print("\n" + "#" * 80)
+    print("PIPELINE COMPLETE")
+    print("#" * 80)
+    print(f"\n  RULE FORMAT GUARANTEE:")
+    print(f"  ✅ var > X          (numeric greater than)")
+    print(f"  ✅ var <= X         (numeric less than or equal)")
+    print(f"  ✅ var = 'value'    (categorical exact match)")
+    print(f"  ❌ NO var BETWEEN X AND Y")
+    print(f"  ❌ NO X < var < Y")
+    print(f"  ❌ NO binned ranges")
+    print(f"\n  RESULTS:")
+    print(f"  Total categorical rules:  {len(results.get('categorical_rules', []))}")
+    print(f"  Total threshold rules:    {len(results.get('threshold_rules', []))}")
+    print(f"  Total combined rules:     {len(results.get('combined_rules', []))}")
+
+    if 'optimal_rule_set' in results and len(results['optimal_rule_set']) > 0:
+        opt = results['optimal_rule_set']
+        print(f"  Optimal rule set size:    {len(opt)}")
+        print(f"  Max fraud capture rate:   {opt['cumulative_capture_rate'].max():.2%}")
+
+    if len(combined_rules) > 0:
+        print(f"\n  Rule type distribution:")
+        for rtype, count in combined_rules['rule_type'].value_counts().items():
+            print(f"    {rtype}: {count}")
+
+        print(f"\n  Rule depth distribution:")
+        for depth, count in combined_rules['combination_depth'].value_counts().sort_index().items():
+            print(f"    {int(depth)}-variable: {count}")
+
+    print(f"\n  KEY OUTPUTS:")
+    print(f"    results['combined_rules']    → All rules ranked")
+    print(f"    results['optimal_rule_set']  → Best non-redundant rules")
+    print(f"    results['categorical_rules'] → Categorical rules only")
+    print(f"    results['threshold_rules']   → Numeric threshold rules only")
+    print(f"    results['python_conditions'] → Copy-paste ready code")
+
+    return results
+
+
+# =============================================================================
+# =============================================================================
+# HOW TO CALL - COMPLETE EXAMPLES
+# =============================================================================
+# =============================================================================
+
+# =============================================================================
+# EXAMPLE 1: FULL PIPELINE (Recommended)
+# =============================================================================
+
+"""
+import pandas as pd
+
+# Load your data
+df = pd.read_csv("your_transactions.csv")
+
+# OR from a database
+# import sqlalchemy
+# engine = sqlalchemy.create_engine("your_connection_string")
+# df = pd.read_sql("SELECT * FROM transactions", engine)
+
+# Run the full pipeline
+results = run_full_rule_generation_pipeline_pandas(
+    df=df,
+    target_flag="fraud_trans",       # Binary 0/1 column
+    target_amt="fraud_amt",          # Fraud dollar amount column
+    min_hit_rate=0.10,               # Minimum 10% precision
+    min_support=100,                 # Minimum 100 records per rule
+    max_combination_depth=3,         # Up to 3-var categorical combos
+    max_cardinality=50,              # Max distinct values for categorical
+    max_variable_depth=5,            # Up to 5-variable numeric rules
+    exclude_patterns=None,           # Use default exclusions
+    export_path="/tmp"               # Export CSVs (or None)
+)
+
+# Access results
+all_rules = results['combined_rules']
+optimal = results['optimal_rule_set']
+conditions = results['python_conditions']
+
+print(all_rules.head(20))
+print(optimal)
+"""
+
+
+# =============================================================================
+# EXAMPLE 2: CALL INDIVIDUAL FUNCTIONS
+# =============================================================================
+
+"""
+import pandas as pd
+
+df = pd.read_csv("your_transactions.csv")
+
+# --- Only categorical rules ---
+cat_rules = generate_fraud_rules_pandas(
+    df=df,
+    target_flag="fraud_trans",
+    target_amt="fraud_amt",
+    min_hit_rate=0.10,
+    max_cardinality=50,
+    min_support=100,
+    max_combination_depth=3
+)
+
+# --- Only numeric threshold rules (up to 5 variables) ---
+num_rules = generate_numeric_threshold_rules_pandas(
+    df=df,
+    target_flag="fraud_trans",
+    target_amt="fraud_amt",
+    min_hit_rate=0.10,
+    min_support=100,
+    max_variable_depth=5,
+    percentile_thresholds=[0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95]
+)
+
+# --- Combine and rank ---
+combined = combine_and_rank_all_rules_pandas(
+    categorical_rules=cat_rules,
+    threshold_rules=num_rules,
+    remove_redundant=True
+)
+
+# --- Apply rules to flag records ---
+flagged_df = apply_rules_to_dataframe_pandas(
+    df=df,
+    rules_df=combined,
+    target_flag="fraud_trans",
+    top_n_rules=20
+)
+
+# --- Greedy selection for optimal set ---
+optimal = greedy_rule_selection_pandas(
+    df=df,
+    rules_df=combined,
+    target_flag="fraud_trans",
+    top_n_rules=30,
+    max_selected=15
+)
+
+# --- Export as Python conditions ---
+conditions = export_rules_as_python_conditions(
+    rules_df=combined,
+    top_n=20,
+    df_variable_name="df"
+)
+"""
+
+
+# =============================================================================
+# EXAMPLE 3: TEST WITH SYNTHETIC DATA
+# =============================================================================
+
+def create_test_data(n_records: int = 100000, seed: int = 42) -> pd.DataFrame:
+    """Create synthetic fraud data for testing."""
+    np.random.seed(seed)
+
+    df = pd.DataFrame({
+        'customer_id': range(1, n_records + 1),
+        'transaction_id': [f'TXN_{i:08d}' for i in range(1, n_records + 1)],
+        'trans_date': pd.date_range('2024-01-01', periods=n_records, freq='min'),
+        'amount': np.random.exponential(500, n_records).round(2),
+        'merchant_category': np.random.choice(
+            ['retail', 'grocery', 'gas', 'online', 'travel'], n_records
+        ),
+        'channel': np.random.choice(['POS', 'online', 'ATM', 'mobile'], n_records),
+        'country': np.random.choice(
+            ['US', 'US', 'US', 'US', 'UK', 'CA', 'MX'], n_records
+        ),
+        'num_trans_24hr': np.random.poisson(3, n_records),
+        'days_since_last': np.random.exponential(10, n_records).astype(int),
+        'distance_from_home': np.random.exponential(50, n_records).round(1),
+        'is_weekend': np.random.choice([0, 1], n_records, p=[0.7, 0.3]),
+        'hour_of_day': np.random.randint(0, 24, n_records),
+        'card_age_months': np.random.randint(1, 60, n_records),
+        'avg_monthly_spend': np.random.normal(2000, 800, n_records).round(0),
+        'model_score': np.random.normal(400, 150, n_records).round(1),
+        'velocity_score': np.random.normal(50, 20, n_records).round(1),
+        'risk_score': np.random.normal(30, 15, n_records).round(1),
+    })
+
+    # Derived features
+    df['ratio_to_avg'] = (df['amount'] / df['avg_monthly_spend'].clip(lower=1) * 30).round(2)
+
+    # Generate fraud based on patterns
+    fraud_prob = np.full(n_records, 0.02)
+    fraud_prob += (df['amount'] > 2000) * 0.15
+    fraud_prob += (df['num_trans_24hr'] > 8) * 0.20
+    fraud_prob += (df['distance_from_home'] > 200) * 0.12
+    fraud_prob += (df['country'] != 'US') * 0.08
+    fraud_prob += ((df['channel'] == 'online') & (df['amount'] > 1000)) * 0.10
+    fraud_prob += (df['hour_of_day'].isin([1, 2, 3, 4])) * 0.05
+    fraud_prob += (df['ratio_to_avg'] > 5) * 0.18
+    fraud_prob += (df['model_score'] > 700) * 0.25
+    fraud_prob += (df['velocity_score'] > 85) * 0.10
+    fraud_prob += (df['risk_score'] > 60) * 0.08
+    fraud_prob = np.clip(fraud_prob, 0, 0.95)
+
+    df['fraud_trans'] = (np.random.random(n_records) < fraud_prob).astype(int)
+    df['fraud_amt'] = df['fraud_trans'] * df['amount']
+
+    print(f"  Synthetic data created: {n_records:,} records")
+    print(f"  Fraud rate: {df['fraud_trans'].mean():.4%}")
+    print(f"  Fraud count: {df['fraud_trans'].sum():,}")
+
+    return df
+
+
+# =============================================================================
+# RUN TEST (Uncomment to execute)
+# =============================================================================
+
+"""
+# Create test data
+print("Creating synthetic test data...")
+df = create_test_data(n_records=100000)
+
+# Run full pipeline
+results = run_full_rule_generation_pipeline_pandas(
+    df=df,
+    target_flag="fraud_trans",
+    target_amt="fraud_amt",
+    min_hit_rate=0.10,
+    min_support=100,
+    max_combination_depth=3,
+    max_cardinality=50,
+    max_variable_depth=5,
+    export_path=None
+)
+
+# View results
+all_rules = results['combined_rules']
+print("\n\nAll rules:")
+print(all_rules[['final_rank', 'rule_description', 'rule_type', 
+                  'combination_depth', 'hit_rate', 'fraud_count', 'lift']].head(30))
+
+optimal = results['optimal_rule_set']
+print("\n\nOptimal rule set:")
+print(optimal[['iteration', 'rule_description', 'combination_depth',
+               'hit_rate', 'marginal_fraud_captured', 'cumulative_capture_rate']])
+
+# Expected output examples:
+# ✅ model_score > 700.0
+# ✅ amount > 2500.0 AND model_score > 700.0
+# ✅ model_score > 700.0 AND velocity_score > 85.0 AND distance_from_home > 200.0
+# ✅ model_score > 700.0 AND amount > 2000.0 AND velocity_score > 85.0 AND risk_score > 60.0
+# ✅ model_score > 700.0 AND amount > 2000.0 AND velocity_score > 85.0 AND risk_score > 60.0 AND num_trans_24hr > 8.0
+"""
+
+
+
+import pandas as pd
+
+# Load your data
+df = pd.read_csv("your_data.csv")
+
+# Run
+results = run_full_rule_generation_pipeline_pandas(
+    df=df,
+    target_flag="fraud_trans",
+    target_amt="fraud_amt",
+    min_hit_rate=0.10,
+    min_support=100,
+    max_variable_depth=5
+)
+
+# Get results
+all_rules = results['combined_rules']
+optimal = results['optimal_rule_set']
+print(all_rules.head(20))
+print(optimal)
