@@ -1351,7 +1351,207 @@ options nomprint nomlogic nosymbolgen;  /* Turn off for clean log */
     run;
 
     %put NOTE: Scoring code saved to: &outpath./fraud_scoring_rules.sas;
+/* ================================================================ */
+/* >>>>>>>>>> PASTE EVERYTHING BELOW HERE <<<<<<<<<<<<<<<<<<<<<<<<< */
+/* ================================================================ */
 
+    /*---------------------------------------------------------*/
+    /* STEP 10B: SAVE ALL RULES TO /frmprod/frmprod.ruleset    */
+    /*---------------------------------------------------------*/
+
+    /* Create directory */
+    x "mkdir -p /frmprod";
+    x "chmod 775 /frmprod";
+
+    /*--- FILE 1: /frmprod/frmprod.ruleset (Complete ruleset) ---*/
+    data _null_;
+        set selected_rules end=last;
+        file "/frmprod/frmprod.ruleset" lrecl=2000;
+
+        if _n_ = 1 then do;
+            put "/*============================================================*/";
+            put "/* FRAUD RULE SET: frmprod.ruleset                             */";
+            put "/* Location: /frmprod/frmprod.ruleset                          */";
+            put "/* Generated: %sysfunc(today(), date9.) %sysfunc(time(), time8.) */";
+            put "/* Minimum Hit Rate Threshold: &min_hit_rate.                  */";
+            put "/* Rule Format: var >= X or var <= X (NO RANGES)               */";
+            put "/*============================================================*/";
+            put " ";
+            put "/*--- RULE SUMMARY ---*/";
+            put "/*";
+            put "  RULE# | SOURCE       | #CONDS | HIT_RATE | FRAUD | FLAGGED | CUM_FRAUD% | RULE_CONDITION";
+            put "  ------+--------------+--------+----------+-------+---------+------------+---------------";
+        end;
+
+        put "  " rule_order z3. "   | " rule_source $12. " | " 
+            n_conditions 3. "    | " hit_rate percent8.2 " | " 
+            fraud_flagged 5. "  | " total_flagged 7. " | "
+            cumulative_fraud_pct percent8.2 "   | " 
+            rule_description $char500.;
+
+        if last then do;
+            put "*/";
+            put " ";
+        end;
+    run;
+
+    /*--- Append executable scoring macro ---*/
+    data _null_;
+        set selected_rules end=last;
+        file "/frmprod/frmprod.ruleset" mod lrecl=2000;
+
+        if _n_ = 1 then do;
+            put "/*============================================================*/";
+            put "/* EXECUTABLE SCORING CODE                                     */";
+            put "/*============================================================*/";
+            put " ";
+            put "%macro apply_frmprod_rules(input_ds=, output_ds=);";
+            put " ";
+            put "data &output_ds.;";
+            put "    set &input_ds.;";
+            put "    length fraud_rule_id 8";
+            put "           fraud_rule_name $50";
+            put "           fraud_rule_condition $1000";
+            put "           all_rules_triggered $2000;";
+            put "    fraud_flag = 0;";
+            put "    fraud_score = 0;";
+            put "    fraud_rule_id = .;";
+            put "    fraud_rule_name = '';";
+            put "    fraud_rule_condition = '';";
+            put "    all_rules_triggered = '';";
+            put " ";
+        end;
+
+        put "    /*--- RULE " rule_order z3. 
+            " | " rule_source $12.
+            " | " n_conditions 1. " conditions"
+            " | Hit Rate: " hit_rate percent8.2 " ---*/";
+        put "    if (" rule_description +(-1) ") then do;";
+        put "        fraud_flag = 1;";
+        put "        fraud_score + 1;";
+        put "        fraud_rule_id = " rule_order 3. ";";
+        put "        fraud_rule_name = 'RULE_" rule_order z3. "';";
+        put "        fraud_rule_condition = '" rule_description +(-1) "';";
+        put "        all_rules_triggered = catx(' | ', all_rules_triggered, 'RULE_" rule_order z3. "');";
+        put "    end;";
+        put " ";
+
+        if last then do;
+            put "    /* Final scoring */";
+            put "    fraud_rule_count = fraud_score;";
+            put "    if fraud_score >= 3 then fraud_priority = 'HIGH';";
+            put "    else if fraud_score >= 2 then fraud_priority = 'MEDIUM';";
+            put "    else if fraud_score >= 1 then fraud_priority = 'LOW';";
+            put "    else fraud_priority = 'NONE';";
+            put " ";
+            put "run;";
+            put " ";
+            put "%mend apply_frmprod_rules;";
+            put " ";
+            put "/*============================================================*/";
+            put "/* USAGE:                                                      */";
+            put "/* %apply_frmprod_rules(                                       */";
+            put "/*     input_ds=new_transactions,                              */";
+            put "/*     output_ds=scored_transactions                           */";
+            put "/* );                                                          */";
+            put "/*============================================================*/";
+        end;
+    run;
+
+    /*--- FILE 2: /frmprod/frmprod_scoring.sas (standalone) ---*/
+    data _null_;
+        set selected_rules end=last;
+        file "/frmprod/frmprod_scoring.sas" lrecl=2000;
+
+        if _n_ = 1 then do;
+            put "/*=== STANDALONE SCORING CODE ===*/";
+            put "/*=== Source: /frmprod/frmprod.ruleset ===*/";
+            put "/*=== Generated: %sysfunc(today(), date9.) ===*/";
+            put " ";
+            put "data scored_output;";
+            put "    set input_transactions;  /* CHANGE THIS */";
+            put "    length fraud_rule_triggered $2000;";
+            put "    fraud_flag = 0;";
+            put "    fraud_score = 0;";
+            put "    fraud_rule_triggered = '';";
+            put " ";
+        end;
+
+        put "    /* Rule " rule_order z3. ": " rule_source +(-1) 
+            " (" n_conditions 1. " conds) Hit=" hit_rate percent8.1 " */";
+        put "    if (" rule_description +(-1) ") then do;";
+        put "        fraud_flag = 1;";
+        put "        fraud_score + 1;";
+        put "        fraud_rule_triggered = catx(' | ', fraud_rule_triggered, 'RULE_" rule_order z3. "');";
+        put "    end;";
+        put " ";
+
+        if last then do;
+            put "    fraud_rule_count = fraud_score;";
+            put "run;";
+        end;
+    run;
+
+    /*--- FILE 3: Save SAS dataset to /frmprod ---*/
+    libname frmprod "/frmprod";
+
+    data frmprod.ruleset;
+        set selected_rules;
+        length rule_name $50
+               rule_condition $1000
+               rule_status $10
+               rule_category $30;
+        format effective_date date9.
+               created_datetime datetime20.;
+
+        rule_name = cats("FRAUD_RULE_", put(rule_order, z3.));
+        rule_condition = rule_description;
+        rule_status = "ACTIVE";
+        rule_category = rule_source;
+        effective_date = today();
+        created_datetime = datetime();
+        min_hit_rate_threshold = &min_hit_rate.;
+    run;
+
+    /* Save ALL candidate rules too */
+    data frmprod.ruleset_all_candidates;
+        set final_all_rules;
+        length rule_status $10;
+        format created_datetime datetime20.;
+        rule_status = "CANDIDATE";
+        created_datetime = datetime();
+    run;
+
+    /* Save validation performance */
+    %if &n_selected. > 0 %then %do;
+        data frmprod.ruleset_validation;
+            set validation_rule_perf;
+            format validation_date date9.;
+            validation_date = today();
+        run;
+    %end;
+
+    libname frmprod clear;
+
+    /*--- Set file permissions ---*/
+    x "chmod 664 /frmprod/frmprod.ruleset";
+    x "chmod 664 /frmprod/frmprod_scoring.sas";
+    x "chmod 664 /frmprod/*.sas7bdat";
+    x "ls -la /frmprod/";
+
+    %put NOTE: =============================================;
+    %put NOTE: RULESET SAVED TO /frmprod/;
+    %put NOTE: Files created:;
+    %put NOTE:   /frmprod/frmprod.ruleset          (rules + scoring macro);
+    %put NOTE:   /frmprod/frmprod_scoring.sas      (standalone scoring);
+    %put NOTE:   /frmprod/ruleset.sas7bdat         (SAS dataset - selected);
+    %put NOTE:   /frmprod/ruleset_all_candidates.sas7bdat (all rules);
+    %put NOTE:   /frmprod/ruleset_validation.sas7bdat     (validation);
+    %put NOTE: =============================================;
+
+/* ================================================================ */
+/* >>>>>>>>>> END OF PASTED CODE <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<< */
+/* ================================================================ */
     /*---------------------------------------------------------*/
     /* STEP 11: VALIDATION ON HOLDOUT SAMPLE                   */
     /*---------------------------------------------------------*/
