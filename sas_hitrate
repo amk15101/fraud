@@ -779,6 +779,153 @@ run;
 %put NOTE: Scoring code written to /tmp/fraud_rules_scoring_code.sas;
 
 /*=============================================================*/
+/* SAVE ALL RULES TO UNIX FOLDER: /frmprod/frmprod.ruleset     */
+/*=============================================================*/
+
+%macro save_ruleset_to_unix(rules_ds=selected_rules, 
+                            outpath=/frmprod, 
+                            outfile=frmprod.ruleset);
+
+    /* Create the directory if it doesn't exist */
+    options dlcreatedir;
+    libname _frm "&outpath.";
+    libname _frm clear;
+
+    /* Alternatively, use X command to create directory */
+    x "mkdir -p &outpath.";
+    x "chmod 775 &outpath.";
+
+    /*---------------------------------------------------------*/
+    /* Write the complete ruleset file                          */
+    /*---------------------------------------------------------*/
+    data _null_;
+        set &rules_ds. end=last;
+        file "&outpath./&outfile." lrecl=2000;
+
+        /*--- FILE HEADER ---*/
+        if _n_ = 1 then do;
+            put "/*============================================================*/";
+            put "/* FRAUD RULE SET: &outfile.                                   */";
+            put "/* Location: &outpath./&outfile.                               */";
+            put "/* Generated: " "%sysfunc(today(), date9.)" " %sysfunc(time(), time8.) */";
+            put "/* Minimum Hit Rate Threshold: &min_hit_rate.                  */";
+            put "/* Total Rules: " "%sysfunc(attrn(open(&rules_ds.),nobs))"     " */";
+            put "/*============================================================*/";
+            put " ";
+            put "/*--- RULE METADATA ---*/";
+            put "/*";
+            put "  RULE_ORDER | SOURCE | HIT_RATE | FRAUD_FLAGGED | TOTAL_FLAGGED | RULE_CONDITION";
+            put "  -----------+--------+----------+---------------+---------------+---------------";
+        end;
+
+        /*--- RULE METADATA COMMENTS ---*/
+        put "  " rule_order 3. "  | " rule_source $12. " | " 
+            hit_rate percent8.2 " | " fraud_flagged 8. " | " 
+            total_flagged 8. " | " rule_description $200.;
+
+        if last then do;
+            put "*/";
+            put " ";
+        end;
+    run;
+
+    /*---------------------------------------------------------*/
+    /* Append the executable rule conditions                    */
+    /*---------------------------------------------------------*/
+    data _null_;
+        set &rules_ds. end=last;
+        file "&outpath./&outfile." mod lrecl=2000;
+
+        if _n_ = 1 then do;
+            put "/*============================================================*/";
+            put "/* EXECUTABLE SCORING RULES                                    */";
+            put "/*============================================================*/";
+            put " ";
+            put "%macro apply_fraud_rules(input_ds=, output_ds=);";
+            put " ";
+            put "data &output_ds.;";
+            put "    set &input_ds.;";
+            put "    length fraud_rule_id 8 fraud_rule_name $100 fraud_rule_condition $500;";
+            put "    fraud_flag = 0;";
+            put "    fraud_rule_id = .;";
+            put "    fraud_rule_name = '';";
+            put "    fraud_rule_condition = '';";
+            put " ";
+        end;
+
+        /*--- EACH RULE AS IF-THEN BLOCK ---*/
+        put "    /*--- RULE " rule_order 3. " ---*/";
+        put "    /* Source: " rule_source $12. 
+            " | Hit Rate: " hit_rate percent8.2 
+            " | Fraud Caught: " fraud_flagged 6. " */";
+        put "    if " rule_description $char500. " then do;";
+        put "        fraud_flag = 1;";
+        put "        fraud_rule_id = " rule_order 3. ";";
+        put "        fraud_rule_name = 'RULE_" rule_order z3. "';";
+        put "        fraud_rule_condition = """ rule_description +(-1) """;";
+        put "        output;";
+        put "    end;";
+        put " ";
+
+        if last then do;
+            put "    /* If no rule triggered, still output */";
+            put "    if fraud_flag = 0 then output;";
+            put " ";
+            put "run;";
+            put " ";
+            put "%mend apply_fraud_rules;";
+            put " ";
+            put "/*============================================================*/";
+            put "/* END OF RULESET                                              */";
+            put "/*============================================================*/";
+        end;
+    run;
+
+    /*---------------------------------------------------------*/
+    /* Also save as a structured dataset for SAS access         */
+    /*---------------------------------------------------------*/
+    libname frmprod "&outpath.";
+
+    data frmprod.ruleset_detail;
+        set &rules_ds.;
+        length rule_name $50 rule_condition $500 
+               rule_status $10 effective_date 8;
+        format effective_date date9.;
+
+        rule_name = cats("FRAUD_RULE_", put(rule_order, z3.));
+        rule_condition = rule_description;
+        rule_status = "ACTIVE";
+        effective_date = today();
+        generation_timestamp = datetime();
+        format generation_timestamp datetime20.;
+    run;
+
+    libname frmprod clear;
+
+    /*---------------------------------------------------------*/
+    /* Set file permissions                                     */
+    /*---------------------------------------------------------*/
+    x "chmod 664 &outpath./&outfile.";
+    x "chmod 664 &outpath./ruleset_detail.sas7bdat";
+
+    %put NOTE: ====================================================;
+    %put NOTE: RULESET SAVED SUCCESSFULLY;
+    %put NOTE: Location: &outpath./&outfile.;
+    %put NOTE: Dataset:  &outpath./ruleset_detail.sas7bdat;
+    %put NOTE: ====================================================;
+
+%mend save_ruleset_to_unix;
+
+/* Execute the save */
+%save_ruleset_to_unix(
+    rules_ds=selected_rules,
+    outpath=/frmprod,
+    outfile=frmprod.ruleset
+);
+
+
+
+/*=============================================================*/
 /* STEP 11: VALIDATION - APPLY RULES TO HOLDOUT SAMPLE */
 /*=============================================================*/
 
