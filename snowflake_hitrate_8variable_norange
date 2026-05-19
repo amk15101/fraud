@@ -169,6 +169,8 @@ def generate_numeric_threshold_rules_snowpark(
     # =========================================================================
     # INITIALIZE ALL RULE LISTS (FIX FOR UnboundLocalError)
     # =========================================================================
+    
+    all_threshold_rules = []
     two_var_rules = []
     three_var_rules = []
     four_var_rules = []
