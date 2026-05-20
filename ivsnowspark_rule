@@ -1,0 +1,1786 @@
+import numpy as np
+import pandas as pd
+from snowflake.snowpark import Session
+from snowflake.snowpark import functions as F
+from snowflake.snowpark.types import *
+from itertools import combinations
+from typing import List, Dict, Tuple, Optional
+
+
+def fraud_rule_miner(sp_df, target_col='FRAUD_TRANS', min_hit_rate=0.10, 
+                     max_variables=None, min_iv=0.02, n_bins=20,
+                     min_rule_support=50, min_precision=0.05):
+    """
+    Mines fraud detection rules from Snowpark DataFrame.
+    
+    Parameters:
+    -----------
+    sp_df : Snowpark DataFrame
+        Input dataframe with features and target
+    target_col : str
+        Target column name (1=fraud, 0=non-fraud)
+    min_hit_rate : float
+        Minimum hit rate (precision) for rules (default 10%)
+    max_variables : int or None
+        Maximum number of variables in a rule. If None, tries 1 to N.
+    min_iv : float
+        Minimum Information Value to consider a variable useful
+    n_bins : int
+        Number of bins for WOE calculation
+    min_rule_support : int
+        Minimum number of records a rule must capture
+    min_precision : float
+        Minimum precision threshold for individual variable cutoffs
+        
+    Returns:
+    --------
+    dict with:
+        - 'rules': List of discovered rules
+        - 'iv_table': IV summary for all variables
+        - 'woe_details': WOE binning details per variable
+        - 'best_rule': Best rule meeting hit rate criteria
+    """
+    
+    # Convert Snowpark DF to Pandas for rule mining
+    print("=" * 70)
+    print("FRAUD RULE MINER - Starting Analysis")
+    print("=" * 70)
+    print(f"\nTarget: {target_col}")
+    print(f"Minimum Hit Rate Required: {min_hit_rate * 100:.1f}%")
+    print(f"\nConverting Snowpark DataFrame to Pandas...")
+    
+    pdf = sp_df.to_pandas()
+    print(f"Dataset Shape: {pdf.shape}")
+    print(f"Fraud Rate: {pdf[target_col].mean() * 100:.4f}%")
+    print(f"Fraud Count: {pdf[target_col].sum()}")
+    print(f"Non-Fraud Count: {(pdf[target_col] == 0).sum()}")
+    
+    # Identify numeric columns (exclude target)
+    numeric_cols = pdf.select_dtypes(include=[np.number]).columns.tolist()
+    numeric_cols = [c for c in numeric_cols if c != target_col]
+    
+    print(f"\nNumeric Features Found: {len(numeric_cols)}")
+    print(f"Features: {numeric_cols}")
+    
+    # =========================================================================
+    # STEP 1: Calculate WOE and IV for each variable
+    # =========================================================================
+    print("\n" + "=" * 70)
+    print("STEP 1: WOE & IV CALCULATION")
+    print("=" * 70)
+    
+    iv_results = {}
+    woe_details = {}
+    variable_cutoffs = {}
+    
+    for col in numeric_cols:
+        iv, woe_table, cutoffs = calculate_woe_iv(
+            pdf, col, target_col, n_bins=n_bins
+        )
+        iv_results[col] = iv
+        woe_details[col] = woe_table
+        if cutoffs:
+            variable_cutoffs[col] = cutoffs
+    
+    # Create IV summary table
+    iv_df = pd.DataFrame({
+        'Variable': list(iv_results.keys()),
+        'IV': list(iv_results.values())
+    }).sort_values('IV', ascending=False).reset_index(drop=True)
+    
+    iv_df['Predictive_Power'] = iv_df['IV'].apply(classify_iv)
+    
+    print("\n--- Information Value Summary ---")
+    print(iv_df.to_string(index=False))
+    
+    # Filter variables with minimum IV
+    useful_vars = iv_df[iv_df['IV'] >= min_iv]['Variable'].tolist()
+    print(f"\nVariables with IV >= {min_iv}: {len(useful_vars)}")
+    print(f"Selected Variables: {useful_vars}")
+    
+    if len(useful_vars) == 0:
+        print("WARNING: No variables meet minimum IV threshold. Using all variables.")
+        useful_vars = numeric_cols
+    
+    # =========================================================================
+    # STEP 2: Find optimal cutoffs for each variable using WOE
+    # =========================================================================
+    print("\n" + "=" * 70)
+    print("STEP 2: FINDING OPTIMAL CUTOFFS PER VARIABLE")
+    print("=" * 70)
+    
+    all_cutoff_rules = []
+    
+    for col in useful_vars:
+        cutoffs = find_optimal_cutoffs(
+            pdf, col, target_col, n_bins=n_bins, 
+            min_hit_rate=min_hit_rate * 0.5,  # Relaxed for individual vars
+            min_support=min_rule_support
+        )
+        
+        if cutoffs:
+            variable_cutoffs[col] = cutoffs
+            for cutoff in cutoffs:
+                all_cutoff_rules.append(cutoff)
+                print(f"  {col}: {cutoff['direction']} {cutoff['threshold']:.4f} | "
+                      f"Hit Rate: {cutoff['hit_rate']:.4f} | "
+                      f"Fraud Captured: {cutoff['fraud_captured']} | "
+                      f"Support: {cutoff['support']}")
+    
+    # =========================================================================
+    # STEP 3: Generate single-variable rules
+    # =========================================================================
+    print("\n" + "=" * 70)
+    print("STEP 3: SINGLE VARIABLE RULES")
+    print("=" * 70)
+    
+    single_var_rules = []
+    
+    for cutoff in all_cutoff_rules:
+        if cutoff['hit_rate'] >= min_hit_rate:
+            rule = {
+                'conditions': [cutoff],
+                'hit_rate': cutoff['hit_rate'],
+                'fraud_captured': cutoff['fraud_captured'],
+                'support': cutoff['support'],
+                'n_variables': 1,
+                'rule_string': f"{cutoff['variable']} {cutoff['direction']} {cutoff['threshold']:.4f}"
+            }
+            single_var_rules.append(rule)
+            print(f"  RULE: {rule['rule_string']} | Hit Rate: {rule['hit_rate']:.2%} | "
+                  f"Fraud: {rule['fraud_captured']} | Support: {rule['support']}")
+    
+    print(f"\nSingle-variable rules meeting {min_hit_rate:.0%} hit rate: {len(single_var_rules)}")
+    
+    # =========================================================================
+    # STEP 4: Generate multi-variable combination rules
+    # =========================================================================
+    print("\n" + "=" * 70)
+    print("STEP 4: MULTI-VARIABLE COMBINATION RULES")
+    print("=" * 70)
+    
+    if max_variables is None:
+        max_variables = min(len(useful_vars), 6)  # Cap at 6 to avoid explosion
+    
+    multi_var_rules = []
+    
+    # Group cutoffs by variable
+    cutoffs_by_var = {}
+    for cutoff in all_cutoff_rules:
+        var = cutoff['variable']
+        if var not in cutoffs_by_var:
+            cutoffs_by_var[var] = []
+        cutoffs_by_var[var].append(cutoff)
+    
+    vars_with_cutoffs = list(cutoffs_by_var.keys())
+    
+    # Try combinations of 2, 3, 4, ... variables
+    for n_vars in range(2, max_variables + 1):
+        print(f"\n  --- Trying {n_vars}-variable combinations ---")
+        rules_found = 0
+        
+        if len(vars_with_cutoffs) < n_vars:
+            print(f"  Not enough variables with cutoffs. Skipping.")
+            continue
+        
+        for var_combo in combinations(vars_with_cutoffs, n_vars):
+            # For each combination of variables, try all cutoff combinations
+            cutoff_lists = [cutoffs_by_var[v] for v in var_combo]
+            
+            # Generate all combinations of cutoffs (one per variable)
+            combo_rules = generate_cutoff_combinations(
+                cutoff_lists, pdf, target_col, 
+                min_hit_rate=min_hit_rate,
+                min_support=min_rule_support
+            )
+            
+            for rule in combo_rules:
+                rule['n_variables'] = n_vars
+                multi_var_rules.append(rule)
+                rules_found += 1
+        
+        print(f"  Rules found with {n_vars} variables: {rules_found}")
+        
+        # If we found good rules, we can optionally stop
+        if rules_found > 0 and n_vars >= 3:
+            good_rules = [r for r in multi_var_rules if r['hit_rate'] >= min_hit_rate]
+            if len(good_rules) >= 10:
+                print(f"  Found sufficient rules. Stopping at {n_vars} variables.")
+                break
+    
+    # =========================================================================
+    # STEP 5: Compile and rank all rules
+    # =========================================================================
+    print("\n" + "=" * 70)
+    print("STEP 5: FINAL RULE RANKING")
+    print("=" * 70)
+    
+    all_rules = single_var_rules + multi_var_rules
+    
+    # Sort by hit_rate descending, then by fraud_captured descending
+    all_rules.sort(key=lambda x: (-x['hit_rate'], -x['fraud_captured']))
+    
+    # Filter rules meeting minimum hit rate
+    qualifying_rules = [r for r in all_rules if r['hit_rate'] >= min_hit_rate]
+    
+    print(f"\nTotal rules generated: {len(all_rules)}")
+    print(f"Rules meeting {min_hit_rate:.0%} hit rate: {len(qualifying_rules)}")
+    
+    if qualifying_rules:
+        print(f"\n{'='*70}")
+        print("TOP 20 RULES (by Hit Rate)")
+        print(f"{'='*70}")
+        
+        for i, rule in enumerate(qualifying_rules[:20], 1):
+            print(f"\n  Rule #{i}:")
+            print(f"    Conditions: {rule['rule_string']}")
+            print(f"    Hit Rate:       {rule['hit_rate']:.2%}")
+            print(f"    Fraud Captured: {rule['fraud_captured']}")
+            print(f"    Support:        {rule['support']}")
+            print(f"    # Variables:    {rule['n_variables']}")
+        
+        best_rule = qualifying_rules[0]
+        print(f"\n{'='*70}")
+        print("BEST RULE:")
+        print(f"{'='*70}")
+        print(f"  {best_rule['rule_string']}")
+        print(f"  Hit Rate: {best_rule['hit_rate']:.2%}")
+        print(f"  Fraud Captured: {best_rule['fraud_captured']}")
+        print(f"  Support: {best_rule['support']}")
+    else:
+        print("\nWARNING: No rules found meeting the minimum hit rate!")
+        print("Showing best available rules:")
+        best_rule = all_rules[0] if all_rules else None
+        for i, rule in enumerate(all_rules[:10], 1):
+            print(f"\n  Rule #{i}:")
+            print(f"    Conditions: {rule['rule_string']}")
+            print(f"    Hit Rate:       {rule['hit_rate']:.2%}")
+            print(f"    Fraud Captured: {rule['fraud_captured']}")
+            print(f"    Support:        {rule['support']}")
+    
+    # =========================================================================
+    # STEP 6: Generate Snowpark filter expression for best rule
+    # =========================================================================
+    if best_rule:
+        print(f"\n{'='*70}")
+        print("SNOWPARK FILTER EXPRESSION FOR BEST RULE:")
+        print(f"{'='*70}")
+        snowpark_expr = generate_snowpark_filter(best_rule)
+        print(f"  {snowpark_expr}")
+    
+    return {
+        'rules': qualifying_rules if qualifying_rules else all_rules[:20],
+        'all_rules': all_rules,
+        'iv_table': iv_df,
+        'woe_details': woe_details,
+        'variable_cutoffs': variable_cutoffs,
+        'best_rule': best_rule,
+        'useful_variables': useful_vars
+    }
+
+
+def calculate_woe_iv(pdf, col, target_col, n_bins=20):
+    """
+    Calculate Weight of Evidence and Information Value for a variable.
+    
+    Returns:
+    --------
+    iv : float - Information Value
+    woe_table : DataFrame - WOE table with bins
+    cutoffs : list - Suggested cutoffs based on WOE
+    """
+    
+    # Handle missing values
+    data = pdf[[col, target_col]].copy()
+    data = data.dropna(subset=[col])
+    
+    if data[col].nunique() <= 1:
+        return 0.0, pd.DataFrame(), []
+    
+    # Create bins
+    try:
+        if data[col].nunique() <= n_bins:
+            # Use actual values as bins for low-cardinality
+            data['bin'] = data[col]
+        else:
+            # Use quantile-based binning
+            data['bin'] = pd.qcut(data[col], q=n_bins, duplicates='drop')
+    except Exception:
+        try:
+            data['bin'] = pd.cut(data[col], bins=n_bins, duplicates='drop')
+        except Exception:
+            return 0.0, pd.DataFrame(), []
+    
+    # Calculate WOE table
+    total_events = data[target_col].sum()  # Total frauds
+    total_non_events = (data[target_col] == 0).sum()  # Total non-frauds
+    
+    if total_events == 0 or total_non_events == 0:
+        return 0.0, pd.DataFrame(), []
+    
+    grouped = data.groupby('bin', observed=True).agg(
+        total_count=(target_col, 'count'),
+        event_count=(target_col, 'sum')
+    ).reset_index()
+    
+    grouped['non_event_count'] = grouped['total_count'] - grouped['event_count']
+    grouped['event_rate'] = grouped['event_count'] / grouped['total_count']
+    grouped['pct_events'] = grouped['event_count'] / total_events
+    grouped['pct_non_events'] = grouped['non_event_count'] / total_non_events
+    
+    # Avoid division by zero
+    grouped['pct_events'] = grouped['pct_events'].replace(0, 0.0001)
+    grouped['pct_non_events'] = grouped['pct_non_events'].replace(0, 0.0001)
+    
+    # WOE = ln(% non-events / % events)
+    # Positive WOE = more non-fraud (good)
+    # Negative WOE = more fraud (bad)
+    grouped['woe'] = np.log(grouped['pct_non_events'] / grouped['pct_events'])
+    grouped['iv_component'] = (grouped['pct_non_events'] - grouped['pct_events']) * grouped['woe']
+    
+    iv = grouped['iv_component'].sum()
+    
+    # Find cutoffs where WOE is very negative (fraud pockets)
+    cutoffs = []
+    
+    # Sort by bin to find thresholds
+    if hasattr(grouped['bin'].iloc[0], 'left'):
+        # Interval bins
+        grouped = grouped.sort_values('bin', key=lambda x: x.apply(lambda v: v.left if hasattr(v, 'left') else v))
+        
+        for _, row in grouped.iterrows():
+            if row['event_rate'] > data[target_col].mean() * 2:  # At least 2x avg fraud rate
+                bin_val = row['bin']
+                if hasattr(bin_val, 'right'):
+                    cutoffs.append({
+                        'variable': col,
+                        'bin_left': bin_val.left,
+                        'bin_right': bin_val.right,
+                        'event_rate': row['event_rate'],
+                        'woe': row['woe'],
+                        'support': row['total_count']
+                    })
+    
+    return iv, grouped, cutoffs
+
+
+def classify_iv(iv):
+    """Classify IV into predictive power categories."""
+    if iv < 0.02:
+        return "Not Predictive"
+    elif iv < 0.1:
+        return "Weak"
+    elif iv < 0.3:
+        return "Medium"
+    elif iv < 0.5:
+        return "Strong"
+    else:
+        return "Very Strong (Suspicious)"
+
+
+def find_optimal_cutoffs(pdf, col, target_col, n_bins=20, 
+                         min_hit_rate=0.05, min_support=50):
+    """
+    Find optimal cutoff points for a variable using > or < only.
+    Tests multiple thresholds and returns those with best hit rates.
+    
+    Returns list of cutoff dictionaries with:
+        - variable, direction (> or <), threshold, hit_rate, fraud_captured, support
+    """
+    
+    data = pdf[[col, target_col]].dropna(subset=[col])
+    
+    if data[col].nunique() <= 1:
+        return []
+    
+    total_fraud = data[target_col].sum()
+    cutoffs = []
+    
+    # Generate candidate thresholds using percentiles
+    percentiles = np.linspace(1, 99, min(n_bins * 2, 50))
+    thresholds = np.percentile(data[col].values, percentiles)
+    thresholds = np.unique(thresholds)
+    
+    # Also add thresholds based on WOE bin boundaries
+    try:
+        _, bins = pd.qcut(data[col], q=n_bins, retbins=True, duplicates='drop')
+        thresholds = np.unique(np.concatenate([thresholds, bins]))
+    except Exception:
+        pass
+    
+    best_gt_cutoff = None  # Best "greater than" cutoff
+    best_lt_cutoff = None  # Best "less than" cutoff
+    
+    for thresh in thresholds:
+        # Test: variable > threshold
+        mask_gt = data[col] > thresh
+        subset_gt = data[mask_gt]
+        
+        if len(subset_gt) >= min_support:
+            fraud_in_subset = subset_gt[target_col].sum()
+            hit_rate_gt = fraud_in_subset / len(subset_gt) if len(subset_gt) > 0 else 0
+            
+            if hit_rate_gt >= min_hit_rate:
+                cutoff_gt = {
+                    'variable': col,
+                    'direction': '>',
+                    'threshold': thresh,
+                    'hit_rate': hit_rate_gt,
+                    'fraud_captured': int(fraud_in_subset),
+                    'support': int(len(subset_gt)),
+                    'pct_fraud_captured': fraud_in_subset / total_fraud if total_fraud > 0 else 0
+                }
+                
+                if best_gt_cutoff is None or hit_rate_gt > best_gt_cutoff['hit_rate']:
+                    best_gt_cutoff = cutoff_gt
+                
+                # Also keep cutoffs with good balance of hit rate and fraud captured
+                cutoffs.append(cutoff_gt)
+        
+        # Test: variable < threshold
+        mask_lt = data[col] < thresh
+        subset_lt = data[mask_lt]
+        
+        if len(subset_lt) >= min_support:
+            fraud_in_subset = subset_lt[target_col].sum()
+            hit_rate_lt = fraud_in_subset / len(subset_lt) if len(subset_lt) > 0 else 0
+            
+            if hit_rate_lt >= min_hit_rate:
+                cutoff_lt = {
+                    'variable': col,
+                    'direction': '<',
+                    'threshold': thresh,
+                    'hit_rate': hit_rate_lt,
+                    'fraud_captured': int(fraud_in_subset),
+                    'support': int(len(subset_lt)),
+                    'pct_fraud_captured': fraud_in_subset / total_fraud if total_fraud > 0 else 0
+                }
+                
+                if best_lt_cutoff is None or hit_rate_lt > best_lt_cutoff['hit_rate']:
+                    best_lt_cutoff = cutoff_lt
+                
+                cutoffs.append(cutoff_lt)
+    
+    # Deduplicate and keep best cutoffs
+    # Strategy: Keep Pareto-optimal cutoffs (best hit_rate for given support level)
+    final_cutoffs = get_pareto_optimal_cutoffs(cutoffs)
+    
+    return final_cutoffs
+
+
+def get_pareto_optimal_cutoffs(cutoffs, max_return=5):
+    """
+    Return Pareto-optimal cutoffs balancing hit_rate and fraud_captured.
+    Keeps diverse set of cutoffs - some with high hit rate, some with high capture.
+    """
+    if not cutoffs:
+        return []
+    
+    # Sort by hit_rate descending
+    sorted_by_hr = sorted(cutoffs, key=lambda x: -x['hit_rate'])
+    
+    # Sort by fraud_captured descending
+    sorted_by_fc = sorted(cutoffs, key=lambda x: -x['fraud_captured'])
+    
+    # Keep top by hit rate
+    pareto = []
+    seen = set()
+    
+    # Best hit rate cutoffs
+    for c in sorted_by_hr[:max_return]:
+        key = (c['variable'], c['direction'], round(c['threshold'], 6))
+        if key not in seen:
+            seen.add(key)
+            pareto.append(c)
+    
+    # Best fraud capture cutoffs
+    for c in sorted_by_fc[:max_return]:
+        key = (c['variable'], c['direction'], round(c['threshold'], 6))
+        if key not in seen:
+            seen.add(key)
+            pareto.append(c)
+    
+    # Also add a "balanced" cutoff (product of hit_rate and pct_fraud_captured)
+    for c in cutoffs:
+        c['score'] = c['hit_rate'] * c.get('pct_fraud_captured', 0)
+    
+    sorted_by_score = sorted(cutoffs, key=lambda x: -x.get('score', 0))
+    for c in sorted_by_score[:max_return]:
+        key = (c['variable'], c['direction'], round(c['threshold'], 6))
+        if key not in seen:
+            seen.add(key)
+            pareto.append(c)
+    
+    return pareto[:max_return * 2]
+
+
+def generate_cutoff_combinations(cutoff_lists, pdf, target_col, 
+                                  min_hit_rate=0.10, min_support=50):
+    """
+    Generate rule combinations from multiple variable cutoffs.
+    Each variable contributes one condition (> or <).
+    
+    Parameters:
+    -----------
+    cutoff_lists : list of lists
+        Each inner list contains cutoff dicts for one variable
+    pdf : DataFrame
+        Full dataset
+    target_col : str
+        Target column
+    min_hit_rate : float
+        Minimum hit rate
+    min_support : int
+        Minimum records matching rule
+        
+    Returns:
+    --------
+    list of rule dictionaries
+    """
+    from itertools import product
+    
+    rules = []
+    
+    # Limit combinations to avoid explosion
+    # Take top 3 cutoffs per variable
+    trimmed_lists = []
+    for cl in cutoff_lists:
+        sorted_cl = sorted(cl, key=lambda x: -x['hit_rate'])[:3]
+        trimmed_lists.append(sorted_cl)
+    
+    # Generate all combinations
+    total_combos = 1
+    for tl in trimmed_lists:
+        total_combos *= len(tl)
+    
+    if total_combos > 10000:
+        # Too many combinations, further trim
+        trimmed_lists = [sorted(cl, key=lambda x: -x['hit_rate'])[:2] for cl in trimmed_lists]
+    
+    for combo in product(*trimmed_lists):
+        # Apply all conditions simultaneously
+        mask = pd.Series([True] * len(pdf), index=pdf.index)
+        
+        conditions = []
+        rule_parts = []
+        
+        for cutoff in combo:
+            col = cutoff['variable']
+            direction = cutoff['direction']
+            threshold = cutoff['threshold']
+            
+            if direction == '>':
+                mask = mask & (pdf[col] > threshold)
+            else:  # '<'
+                mask = mask & (pdf[col] < threshold)
+            
+            conditions.append(cutoff)
+            rule_parts.append(f"{col} {direction} {threshold:.4f}")
+        
+        subset = pdf[mask]
+        support = len(subset)
+        
+        if support >= min_support:
+            fraud_count = subset[target_col].sum()
+            hit_rate = fraud_count / support if support > 0 else 0
+            
+            if hit_rate >= min_hit_rate * 0.8:  # Slightly relaxed to capture near-misses
+                rule = {
+                    'conditions': list(combo),
+                    'hit_rate': hit_rate,
+                    'fraud_captured': int(fraud_count),
+                    'support': int(support),
+                    'n_variables': len(combo),
+                    'rule_string': ' AND '.join(rule_parts),
+                    'pct_fraud_captured': fraud_count / pdf[target_col].sum() if pdf[target_col].sum() > 0 else 0
+                }
+                rules.append(rule)
+    
+    return rules
+
+
+def generate_snowpark_filter(rule):
+    """
+    Generate a Snowpark-compatible filter expression string for a rule.
+    
+    Parameters:
+    -----------
+    rule : dict
+        Rule dictionary with 'conditions' list
+        
+    Returns:
+    --------
+    str : Snowpark filter expression
+    """
+    filter_parts = []
+    
+    for condition in rule['conditions']:
+        col = condition['variable']
+        direction = condition['direction']
+        threshold = condition['threshold']
+        
+        if direction == '>':
+            filter_parts.append(f'(F.col("{col}") > {threshold})')
+        else:
+            filter_parts.append(f'(F.col("{col}") < {threshold})')
+    
+    snowpark_filter = ' & '.join(filter_parts)
+    return f"sp_df.filter({snowpark_filter})"
+
+
+def apply_best_rule_snowpark(sp_df, rule, target_col='FRAUD_TRANS'):
+    """
+    Apply the best rule to a Snowpark DataFrame and return flagged records.
+    
+    Parameters:
+    -----------
+    sp_df : Snowpark DataFrame
+    rule : dict - Rule dictionary from fraud_rule_miner
+    target_col : str - Target column name
+    
+    Returns:
+    --------
+    Snowpark DataFrame with flagged fraud records
+    """
+    
+    filter_condition = None
+    
+    for condition in rule['conditions']:
+        col = condition['variable']
+        direction = condition['direction']
+        threshold = condition['threshold']
+        
+        if direction == '>':
+            cond = F.col(col) > threshold
+        else:
+            cond = F.col(col) < threshold
+        
+        if filter_condition is None:
+            filter_condition = cond
+        else:
+            filter_condition = filter_condition & cond
+    
+    # Add a flag column
+    flagged_df = sp_df.with_column(
+        'FRAUD_RULE_FLAG',
+        F.when(filter_condition, F.lit(1)).otherwise(F.lit(0))
+    )
+    
+    return flagged_df
+
+
+def evaluate_rule_on_snowpark(sp_df, rule, target_col='FRAUD_TRANS'):
+    """
+    Evaluate a rule directly on Snowpark DataFrame (without converting to pandas).
+    
+    Parameters:
+    -----------
+    sp_df : Snowpark DataFrame
+    rule : dict - Rule dictionary
+    target_col : str - Target column
+    
+    Returns:
+    --------
+    dict with evaluation metrics
+    """
+    
+    filter_condition = None
+    
+    for condition in rule['conditions']:
+        col = condition['variable']
+        direction = condition['direction']
+        threshold = condition['threshold']
+        
+        if direction == '>':
+            cond = F.col(col) > threshold
+        else:
+            cond = F.col(col) < threshold
+        
+        if filter_condition is None:
+            filter_condition = cond
+        else:
+            filter_condition = filter_condition & cond
+    
+    # Total counts
+    total_stats = sp_df.agg(
+        F.count('*').alias('TOTAL_COUNT'),
+        F.sum(F.col(target_col)).alias('TOTAL_FRAUD')
+    ).collect()[0]
+    
+    total_count = total_stats['TOTAL_COUNT']
+    total_fraud = total_stats['TOTAL_FRAUD']
+    
+    # Filtered counts
+    filtered_df = sp_df.filter(filter_condition)
+    filtered_stats = filtered_df.agg(
+        F.count('*').alias('RULE_COUNT'),
+        F.sum(F.col(target_col)).alias('RULE_FRAUD')
+    ).collect()[0]
+    
+    rule_count = filtered_stats['RULE_COUNT']
+    rule_fraud = filtered_stats['RULE_FRAUD']
+    
+    hit_rate = rule_fraud / rule_count if rule_count > 0 else 0
+    fraud_capture_rate = rule_fraud / total_fraud if total_fraud > 0 else 0
+    
+    results = {
+        'rule_string': rule['rule_string'],
+        'total_records': total_count,
+        'total_fraud': total_fraud,
+        'rule_flagged': rule_count,
+        'rule_fraud': rule_fraud,
+        'hit_rate': hit_rate,
+        'fraud_capture_rate': fraud_capture_rate,
+        'false_positive_count': rule_count - rule_fraud,
+        'false_positive_rate': (rule_count - rule_fraud) / (total_count - total_fraud) if (total_count - total_fraud) > 0 else 0
+    }
+    
+    print(f"\n{'='*70}")
+    print("RULE EVALUATION ON SNOWPARK DATAFRAME")
+    print(f"{'='*70}")
+    print(f"  Rule: {results['rule_string']}")
+    print(f"  Total Records:        {results['total_records']:,}")
+    print(f"  Total Fraud:          {results['total_fraud']:,}")
+    print(f"  Rule Flagged:         {results['rule_flagged']:,}")
+    print(f"  Rule Fraud (TP):      {results['rule_fraud']:,}")
+    print(f"  Hit Rate (Precision): {results['hit_rate']:.2%}")
+    print(f"  Fraud Capture Rate:   {results['fraud_capture_rate']:.2%}")
+    print(f"  False Positives:      {results['false_positive_count']:,}")
+    print(f"  FP Rate:              {results['false_positive_rate']:.4%}")
+    
+    return results
+
+
+def advanced_fraud_rule_miner(sp_df, target_col='FRAUD_TRANS', min_hit_rate=0.10,
+                               max_variables=5, n_bins=20, min_support=50,
+                               use_decision_tree=True, tree_depth=4):
+    """
+    Advanced version that also uses Decision Tree to guide rule discovery.
+    
+    This helps find complex fraud pockets that simple threshold scanning might miss.
+    
+    Parameters:
+    -----------
+    sp_df : Snowpark DataFrame
+    target_col : str
+    min_hit_rate : float
+    max_variables : int
+    n_bins : int
+    min_support : int
+    use_decision_tree : bool - Whether to use DT for initial rule hints
+    tree_depth : int - Max depth of decision tree
+    
+    Returns:
+    --------
+    dict with rules and analysis
+    """
+    
+    print("=" * 70)
+    print("ADVANCED FRAUD RULE MINER")
+    print("=" * 70)
+    
+    pdf = sp_df.to_pandas()
+    
+    numeric_cols = pdf.select_dtypes(include=[np.number]).columns.tolist()
+    numeric_cols = [c for c in numeric_cols if c != target_col]
+    
+    # First run basic miner
+    basic_results = fraud_rule_miner(
+        sp_df, target_col=target_col, min_hit_rate=min_hit_rate,
+        max_variables=max_variables, n_bins=n_bins, min_rule_support=min_support
+    )
+    
+    tree_rules = []
+    
+    if use_decision_tree:
+        print(f"\n{'='*70}")
+        print("DECISION TREE GUIDED RULE EXTRACTION")
+        print(f"{'='*70}")
+        
+        try:
+            from sklearn.tree import DecisionTreeClassifier
+            from sklearn.tree import export_text
+            
+            # Prepare data
+            X = pdf[numeric_cols].fillna(0)
+            y = pdf[target_col]
+            
+            # Fit decision tree with class weight to handle imbalance
+            dt = DecisionTreeClassifier(
+                max_depth=tree_depth,
+                min_samples_leaf=min_support,
+                class_weight='balanced',
+                random_state=42
+            )
+            dt.fit(X, y)
+            
+            # Extract rules from tree
+            tree_rules = extract_rules_from_tree(
+                dt, numeric_cols, pdf, target_col, 
+                min_hit_rate=min_hit_rate, min_support=min_support
+            )
+            
+            print(f"\n  Decision Tree Rules Found: {len(tree_rules)}")
+            for i, rule in enumerate(tree_rules[:10], 1):
+                print(f"\n  DT Rule #{i}:")
+                print(f"    {rule['rule_string']}")
+                print(f"    Hit Rate: {rule['hit_rate']:.2%} | Fraud: {rule['fraud_captured']} | Support: {rule['support']}")
+        
+        except ImportError:
+            print("  sklearn not available. Skipping decision tree analysis.")
+        except Exception as e:
+            print(f"  Decision tree analysis failed: {e}")
+    
+    # Combine all rules
+    all_rules = basic_results.get('rules', []) + tree_rules
+    all_rules.sort(key=lambda x: (-x['hit_rate'], -x['fraud_captured']))
+    
+    # Remove duplicates (same rule_string)
+    seen_rules = set()
+    unique_rules = []
+    for rule in all_rules:
+        if rule['rule_string'] not in seen_rules:
+            seen_rules.add(rule['rule_string'])
+            unique_rules.append(rule)
+    
+    # Final filtering
+    qualifying_rules = [r for r in unique_rules if r['hit_rate'] >= min_hit_rate]
+    
+    print(f"\n{'='*70}")
+    print("FINAL COMBINED RESULTS")
+    print(f"{'='*70}")
+    print(f"Total Qualifying Rules: {len(qualifying_rules)}")
+    
+    if qualifying_rules:
+        print(f"\nTOP 10 BEST RULES:")
+        for i, rule in enumerate(qualifying_rules[:10], 1):
+            print(f"\n  #{i}: {rule['rule_string']}")
+            print(f"      Hit Rate: {rule['hit_rate']:.2%} | "
+                  f"Fraud: {rule['fraud_captured']} | "
+                  f"Support: {rule['support']} | "
+                  f"Vars: {rule['n_variables']}")
+    
+    basic_results['rules'] = qualifying_rules
+    basic_results['tree_rules'] = tree_rules
+    basic_results['best_rule'] = qualifying_rules[0] if qualifying_rules else basic_results.get('best_rule')
+    
+    return basic_results
+
+
+def extract_rules_from_tree(dt, feature_names, pdf, target_col, 
+                            min_hit_rate=0.10, min_support=50):
+    """
+    Extract rules from a fitted decision tree, converting to > / < format only.
+    
+    Parameters:
+    -----------
+    dt : DecisionTreeClassifier
+    feature_names : list
+    pdf : DataFrame
+    target_col : str
+    min_hit_rate : float
+    min_support : int
+    
+    Returns:
+    --------
+    list of rule dictionaries
+    """
+    
+    tree = dt.tree_
+    rules = []
+    
+    def recurse(node, conditions):
+        # If leaf node
+        if tree.children_left[node] == tree.children_right[node]:
+            # Evaluate this path
+            if conditions:
+                mask = pd.Series([True] * len(pdf), index=pdf.index)
+                rule_parts = []
+                condition_list = []
+                
+                for col, direction, threshold in conditions:
+                    if direction == '<=':
+                        # Convert <= to <  (using slightly higher threshold)
+                        mask = mask & (pdf[col] < threshold)
+                        cond = {
+                            'variable': col,
+                            'direction': '<',
+                            'threshold': threshold
+                        }
+                        rule_parts.append(f"{col} < {threshold:.4f}")
+                    else:
+                        # Convert > to >
+                        mask = mask & (pdf[col] > threshold)
+                        cond = {
+                            'variable': col,
+                            'direction': '>',
+                            'threshold': threshold
+                        }
+                        rule_parts.append(f"{col} > {threshold:.4f}")
+                    
+                    condition_list.append(cond)
+                
+                subset = pdf[mask]
+                support = len(subset)
+                
+                if support >= min_support:
+                    fraud_count = subset[target_col].sum()
+                    hit_rate = fraud_count / support if support > 0 else 0
+                    
+                    if hit_rate >= min_hit_rate:
+                        # Count unique variables
+                        unique_vars = set(c['variable'] for c in condition_list)
+                        
+                        rule = {
+                            'conditions': condition_list,
+                            'hit_rate': hit_rate,
+                            'fraud_captured': int(fraud_count),
+                            'support': int(support),
+                            'n_variables': len(unique_vars),
+                            'rule_string': ' AND '.join(rule_parts),
+                            'pct_fraud_captured': fraud_count / pdf[target_col].sum() if pdf[target_col].sum() > 0 else 0
+                        }
+                        rules.append(rule)
+            return
+        
+        # Get feature and threshold for this node
+        feature_idx = tree.feature[node]
+        threshold = tree.threshold[node]
+        col = feature_names[feature_idx]
+        
+        # Left child: feature <= threshold
+        left_conditions = conditions + [(col, '<=', threshold)]
+        recurse(tree.children_left[node], left_conditions)
+        
+        # Right child: feature > threshold
+        right_conditions = conditions + [(col, '>', threshold)]
+        recurse(tree.children_right[node], right_conditions)
+    
+    recurse(0, [])
+    
+    return rules
+
+
+def iterative_rule_refinement(sp_df, initial_rules, target_col='FRAUD_TRANS',
+                               min_hit_rate=0.10, min_support=50,
+                               refinement_steps=3):
+    """
+    Iteratively refine rules by adjusting thresholds to maximize hit rate.
+    
+    Parameters:
+    -----------
+    sp_df : Snowpark DataFrame
+    initial_rules : list of rule dicts
+    target_col : str
+    min_hit_rate : float
+    min_support : int
+    refinement_steps : int - Number of refinement iterations
+    
+    Returns:
+    --------
+    list of refined rules
+    """
+    
+    print(f"\n{'='*70}")
+    print("ITERATIVE RULE REFINEMENT")
+    print(f"{'='*70}")
+    
+    pdf = sp_df.to_pandas()
+    refined_rules = []
+    
+    for rule_idx, rule in enumerate(initial_rules[:20]):  # Refine top 20 rules
+        print(f"\n  Refining Rule #{rule_idx + 1}: {rule['rule_string']}")
+        
+        best_rule = rule.copy()
+        best_hit_rate = rule['hit_rate']
+        
+        for step in range(refinement_steps):
+            # Try adjusting each condition's threshold
+            for cond_idx, condition in enumerate(rule['conditions']):
+                col = condition['variable']
+                direction = condition['direction']
+                current_threshold = condition['threshold']
+                
+                # Generate candidate thresholds around current
+                if direction == '>':
+                    # Try increasing threshold (tighter rule, higher hit rate)
+                    candidates = np.linspace(
+                        current_threshold,
+                        current_threshold * 1.5 if current_threshold > 0 else current_threshold + abs(current_threshold) * 0.5 + 1,
+                        10
+                    )
+                else:
+                    # Try decreasing threshold (tighter rule, higher hit rate)
+                    candidates = np.linspace(
+                        current_threshold * 0.5 if current_threshold > 0 else current_threshold - abs(current_threshold) * 0.5 - 1,
+                        current_threshold,
+                        10
+                    )
+                
+                for new_thresh in candidates:
+                    # Build mask with modified condition
+                    mask = pd.Series([True] * len(pdf), index=pdf.index)
+                    new_conditions = []
+                    rule_parts = []
+                    
+                    for ci, cond in enumerate(rule['conditions']):
+                        c_col = cond['variable']
+                        c_dir = cond['direction']
+                        c_thresh = new_thresh if ci == cond_idx else cond['threshold']
+                        
+                        if c_dir == '>':
+                            mask = mask & (pdf[c_col] > c_thresh)
+                        else:
+                            mask = mask & (pdf[c_col] < c_thresh)
+                        
+                        new_cond = {
+                            'variable': c_col,
+                            'direction': c_dir,
+                            'threshold': c_thresh
+                        }
+                        new_conditions.append(new_cond)
+                        rule_parts.append(f"{c_col} {c_dir} {c_thresh:.4f}")
+                    
+                    subset = pdf[mask]
+                    support = len(subset)
+                    
+                    if support >= min_support:
+                        fraud_count = subset[target_col].sum()
+                        hit_rate = fraud_count / support if support > 0 else 0
+                        
+                        if hit_rate > best_hit_rate:
+                            best_hit_rate = hit_rate
+                            best_rule = {
+                                'conditions': new_conditions,
+                                'hit_rate': hit_rate,
+                                'fraud_captured': int(fraud_count),
+                                'support': int(support),
+                                'n_variables': rule['n_variables'],
+                                'rule_string': ' AND '.join(rule_parts),
+                                'pct_fraud_captured': fraud_count / pdf[target_col].sum() if pdf[target_col].sum() > 0 else 0
+                            }
+        
+        if best_hit_rate > rule['hit_rate']:
+            print(f"    Improved: {rule['hit_rate']:.2%} -> {best_hit_rate:.2%}")
+            print(f"    New Rule: {best_rule['rule_string']}")
+        else:
+            print(f"    No improvement found. Keeping original.")
+        
+        refined_rules.append(best_rule)
+    
+    # Sort refined rules
+    refined_rules.sort(key=lambda x: (-x['hit_rate'], -x['fraud_captured']))
+    
+    return refined_rules
+
+
+def generate_rule_report(results, output_file=None):
+    """
+    Generate a comprehensive report of all discovered rules.
+    
+    Parameters:
+    -----------
+    results : dict - Output from fraud_rule_miner or advanced_fraud_rule_miner
+    output_file : str or None - If provided, save report to file
+    
+    Returns:
+    --------
+    str : Report text
+    """
+    
+    report_lines = []
+    
+    report_lines.append("=" * 80)
+    report_lines.append("FRAUD DETECTION RULE MINING REPORT")
+    report_lines.append("=" * 80)
+    
+    # IV Summary
+    report_lines.append("\n\n1. INFORMATION VALUE (IV) SUMMARY")
+    report_lines.append("-" * 50)
+    if 'iv_table' in results and results['iv_table'] is not None:
+        report_lines.append(results['iv_table'].to_string(index=False))
+    
+    # Best Rule
+    report_lines.append("\n\n2. BEST RULE")
+    report_lines.append("-" * 50)
+    if results.get('best_rule'):
+        br = results['best_rule']
+        report_lines.append(f"  Rule:             {br['rule_string']}")
+        report_lines.append(f"  Hit Rate:         {br['hit_rate']:.2%}")
+        report_lines.append(f"  Fraud Captured:   {br['fraud_captured']}")
+        report_lines.append(f"  Support:          {br['support']}")
+        report_lines.append(f"  # Variables:      {br['n_variables']}")
+    
+    # All Qualifying Rules
+    report_lines.append("\n\n3. ALL QUALIFYING RULES")
+    report_lines.append("-" * 50)
+    rules = results.get('rules', [])
+    for i, rule in enumerate(rules[:50], 1):
+        report_lines.append(f"\n  Rule #{i}:")
+        report_lines.append(f"    {rule['rule_string']}")
+        report_lines.append(f"    Hit Rate: {rule['hit_rate']:.2%} | "
+                           f"Fraud: {rule['fraud_captured']} | "
+                           f"Support: {rule['support']} | "
+                           f"Vars: {rule['n_variables']}")
+    
+    # Snowpark Implementation
+    report_lines.append("\n\n4. SNOWPARK IMPLEMENTATION")
+    report_lines.append("-" * 50)
+    if results.get('best_rule'):
+        snowpark_code = generate_snowpark_implementation(results['best_rule'])
+        report_lines.append(snowpark_code)
+    
+    report_text = '\n'.join(report_lines)
+    
+    if output_file:
+        with open(output_file, 'w') as f:
+            f.write(report_text)
+        print(f"\nReport saved to: {output_file}")
+    
+    return report_text
+
+
+def generate_snowpark_implementation(rule):
+    """
+    Generate complete Snowpark implementation code for a rule.
+    
+    Parameters:
+    -----------
+    rule : dict - Rule dictionary
+    
+    Returns:
+    --------
+    str : Python code string
+    """
+    
+    code_lines = []
+    code_lines.append("# Snowpark Implementation for Fraud Rule")
+    code_lines.append("from snowflake.snowpark import functions as F")
+    code_lines.append("")
+    code_lines.append("def apply_fraud_rule(sp_df):")
+    code_lines.append(f'    """')
+    code_lines.append(f'    Rule: {rule["rule_string"]}')
+    code_lines.append(f'    Expected Hit Rate: {rule["hit_rate"]:.2%}')
+    code_lines.append(f'    """')
+    code_lines.append("")
+    
+    # Build filter condition
+    filter_parts = []
+    for condition in rule['conditions']:
+        col = condition['variable']
+        direction = condition['direction']
+        threshold = condition['threshold']
+        
+        if direction == '>':
+            filter_parts.append(f'    cond_{col.lower()} = F.col("{col}") > {threshold}')
+        else:
+            filter_parts.append(f'    cond_{col.lower()} = F.col("{col}") < {threshold}')
+    
+    code_lines.extend(filter_parts)
+    code_lines.append("")
+    
+    # Combine conditions
+    cond_vars = [f'cond_{c["variable"].lower()}' for c in rule['conditions']]
+    combined = ' & '.join(cond_vars)
+    code_lines.append(f'    combined_condition = {combined}')
+    code_lines.append("")
+    code_lines.append('    # Flag suspicious transactions')
+    code_lines.append('    result_df = sp_df.with_column(')
+    code_lines.append('        "FRAUD_RULE_FLAG",')
+    code_lines.append('        F.when(combined_condition, F.lit(1)).otherwise(F.lit(0))')
+    code_lines.append('    )')
+    code_lines.append("")
+    code_lines.append('    return result_df')
+    
+    return '\n'.join(code_lines)
+
+
+def rule_overlap_analysis(sp_df, rules, target_col='FRAUD_TRANS', top_n=10):
+    """
+    Analyze overlap between top rules to find complementary rules
+    that together capture more fraud.
+    
+    Parameters:
+    -----------
+    sp_df : Snowpark DataFrame
+    rules : list of rule dicts
+    target_col : str
+    top_n : int - Number of top rules to analyze
+    
+    Returns:
+    --------
+    dict with overlap analysis
+    """
+    
+    print(f"\n{'='*70}")
+    print("RULE OVERLAP ANALYSIS")
+    print(f"{'='*70}")
+    
+    pdf = sp_df.to_pandas()
+    total_fraud = pdf[target_col].sum()
+    
+    # Get masks for each rule
+    rule_masks = []
+    for rule in rules[:top_n]:
+        mask = pd.Series([True] * len(pdf), index=pdf.index)
+        for condition in rule['conditions']:
+            col = condition['variable']
+            direction = condition['direction']
+            threshold = condition['threshold']
+            
+            if direction == '>':
+                mask = mask & (pdf[col] > threshold)
+            else:
+                mask = mask & (pdf[col] < threshold)
+        
+        rule_masks.append(mask)
+    
+    # Find best non-overlapping rule combination
+    print("\n  Finding best complementary rule combinations...")
+    
+    best_combo = None
+    best_total_fraud_captured = 0
+    best_combined_hit_rate = 0
+    
+    for i in range(len(rule_masks)):
+        for j in range(i + 1, len(rule_masks)):
+            combined_mask = rule_masks[i] | rule_masks[j]
+            combined_support = combined_mask.sum()
+            combined_fraud = pdf.loc[combined_mask, target_col].sum()
+            combined_hit_rate = combined_fraud / combined_support if combined_support > 0 else 0
+            
+            if combined_fraud > best_total_fraud_captured and combined_hit_rate >= 0.10:
+                best_total_fraud_captured = combined_fraud
+                best_combined_hit_rate = combined_hit_rate
+                best_combo = (i, j)
+    
+    if best_combo:
+        i, j = best_combo
+        print(f"\n  Best Complementary Pair:")
+        print(f"    Rule A: {rules[i]['rule_string']}")
+        print(f"    Rule B: {rules[j]['rule_string']}")
+        print(f"    Combined Fraud Captured: {best_total_fraud_captured}")
+        print(f"    Combined Hit Rate: {best_combined_hit_rate:.2%}")
+        print(f"    Fraud Capture Rate: {best_total_fraud_captured / total_fraud:.2%}")
+    
+    # Greedy combination for maximum fraud capture
+    print("\n  Greedy Rule Stacking (OR logic):")
+    
+    combined_mask = pd.Series([False] * len(pdf), index=pdf.index)
+    selected_rules = []
+    
+    for idx in range(len(rule_masks)):
+        new_combined = combined_mask | rule_masks[idx]
+        new_support = new_combined.sum()
+        new_fraud = pdf.loc[new_combined, target_col].sum()
+        new_hit_rate = new_fraud / new_support if new_support > 0 else 0
+        
+        # Only add if hit rate stays above threshold
+        if new_hit_rate >= 0.10:
+            incremental_fraud = new_fraud - pdf.loc[combined_mask, target_col].sum()
+            if incremental_fraud > 0:
+                combined_mask = new_combined
+                selected_rules.append(idx)
+                print(f"    + Rule #{idx + 1}: +{int(incremental_fraud)} fraud | "
+                      f"Cumulative: {int(new_fraud)} fraud | "
+                      f"Hit Rate: {new_hit_rate:.2%} | "
+                      f"Capture: {new_fraud / total_fraud:.2%}")
+    
+    final_support = combined_mask.sum()
+    final_fraud = pdf.loc[combined_mask, target_col].sum()
+    final_hit_rate = final_fraud / final_support if final_support > 0 else 0
+    
+    print(f"\n  FINAL STACKED RESULT:")
+    print(f"    Rules Used: {len(selected_rules)}")
+    print(f"    Total Flagged: {final_support:,}")
+    print(f"    Total Fraud Captured: {int(final_fraud):,}")
+    print(f"    Overall Hit Rate: {final_hit_rate:.2%}")
+    print(f"    Fraud Capture Rate: {final_fraud / total_fraud:.2%}")
+    
+    return {
+        'selected_rule_indices': selected_rules,
+        'combined_hit_rate': final_hit_rate,
+        'combined_fraud_captured': int(final_fraud),
+        'combined_support': int(final_support),
+        'fraud_capture_rate': final_fraud / total_fraud
+    }
+
+
+# =============================================================================
+# MAIN EXECUTION EXAMPLE
+# =============================================================================
+
+def run_full_analysis(sp_df, target_col='FRAUD_TRANS', min_hit_rate=0.10):
+    """
+    Run the complete fraud rule mining pipeline.
+    
+    Parameters:
+    -----------
+    sp_df : Snowpark DataFrame
+    target_col : str - Target column (0=non-fraud, 1=fraud)
+    min_hit_rate : float - Minimum hit rate (default 10%)
+    
+    Returns:
+    --------
+    dict with all results
+    """
+    
+    print("\n" + "#" * 80)
+    print("#" + " " * 25 + "FULL FRAUD ANALYSIS PIPELINE" + " " * 25 + "#")
+    print("#" * 80)
+    
+    # Step 1: Run advanced miner (includes basic + decision tree)
+    results = advanced_fraud_rule_miner(
+        sp_df=sp_df,
+        target_col=target_col,
+        min_hit_rate=min_hit_rate,
+        max_variables=5,
+        n_bins=20,
+        min_support=50,
+        use_decision_tree=True,
+        tree_depth=4
+    )
+    
+    # Step 2: Refine top rules
+    if results.get('rules'):
+        refined_rules = iterative_rule_refinement(
+            sp_df=sp_df,
+            initial_rules=results['rules'][:10],
+            target_col=target_col,
+            min_hit_rate=min_hit_rate,
+            min_support=50,
+            refinement_steps=3
+        )
+        results['refined_rules'] = refined_rules
+        
+        # Update best rule if refinement improved it
+        if refined_rules and refined_rules[0]['hit_rate'] > results['best_rule']['hit_rate']:
+            results['best_rule'] = refined_rules[0]
+    
+    # Step 3: Overlap analysis for rule stacking
+    all_rules = results.get('refined_rules', results.get('rules', []))
+    if len(all_rules) >= 2:
+        overlap_results = rule_overlap_analysis(
+            sp_df=sp_df,
+            rules=all_rules,
+            target_col=target_col,
+            top_n=10
+        )
+        results['overlap_analysis'] = overlap_results
+    
+    # Step 4: Evaluate best rule on Snowpark
+    if results.get('best_rule'):
+        eval_results = evaluate_rule_on_snowpark(
+            sp_df=sp_df,
+            rule=results['best_rule'],
+            target_col=target_col
+        )
+        results['evaluation'] = eval_results
+    
+    # Step 5: Generate report
+    report = generate_rule_report(results)
+    results['report'] = report
+    
+    # Step 6: Print final summary
+    print("\n" + "#" * 80)
+    print("#" + " " * 30 + "FINAL SUMMARY" + " " * 35 + "#")
+    print("#" * 80)
+    
+    if results.get('best_rule'):
+        br = results['best_rule']
+        print(f"\n  BEST RULE FOUND:")
+        print(f"  {'─' * 60}")
+        print(f"  Rule:           {br['rule_string']}")
+        print(f"  Hit Rate:       {br['hit_rate']:.2%}")
+        print(f"  Fraud Captured: {br['fraud_captured']}")
+        print(f"  Support:        {br['support']}")
+        print(f"  # Variables:    {br['n_variables']}")
+        
+        if br['hit_rate'] >= min_hit_rate:
+            print(f"\n  ✅ SUCCESS: Hit rate {br['hit_rate']:.2%} meets minimum threshold {min_hit_rate:.2%}")
+        else:
+            print(f"\n  ⚠️ WARNING: Hit rate {br['hit_rate']:.2%} below minimum threshold {min_hit_rate:.2%}")
+            print(f"  Consider relaxing constraints or adding more features.")
+    
+    print(f"\n  SNOWPARK IMPLEMENTATION:")
+    print(f"  {'─' * 60}")
+    if results.get('best_rule'):
+        print(f"  {generate_snowpark_filter(results['best_rule'])}")
+    
+    print(f"\n{'#' * 80}")
+    print(f"  Analysis Complete!")
+    print(f"{'#' * 80}\n")
+    
+    return results
+
+
+def create_fraud_flag_table(sp_df, rules, target_col='FRAUD_TRANS', 
+                            output_table_name='FRAUD_FLAGGED_TRANSACTIONS'):
+    """
+    Create a Snowflake table with fraud flags based on discovered rules.
+    Applies multiple rules and creates flag columns for each.
+    
+    Parameters:
+    -----------
+    sp_df : Snowpark DataFrame
+    rules : list of rule dicts
+    target_col : str
+    output_table_name : str - Name of output table in Snowflake
+    
+    Returns:
+    --------
+    Snowpark DataFrame with flag columns
+    """
+    
+    print(f"\n{'='*70}")
+    print("CREATING FRAUD FLAG TABLE IN SNOWFLAKE")
+    print(f"{'='*70}")
+    
+    result_df = sp_df
+    
+    for i, rule in enumerate(rules[:10], 1):  # Apply top 10 rules
+        filter_condition = None
+        
+        for condition in rule['conditions']:
+            col = condition['variable']
+            direction = condition['direction']
+            threshold = condition['threshold']
+            
+            if direction == '>':
+                cond = F.col(col) > threshold
+            else:
+                cond = F.col(col) < threshold
+            
+            if filter_condition is None:
+                filter_condition = cond
+            else:
+                filter_condition = filter_condition & cond
+        
+        flag_col_name = f'FRAUD_RULE_{i}_FLAG'
+        result_df = result_df.with_column(
+            flag_col_name,
+            F.when(filter_condition, F.lit(1)).otherwise(F.lit(0))
+        )
+        
+        print(f"  Added column: {flag_col_name} | Rule: {rule['rule_string'][:60]}...")
+    
+    # Create combined flag (any rule fires)
+    flag_cols = [f'FRAUD_RULE_{i}_FLAG' for i in range(1, min(len(rules), 10) + 1)]
+    
+    if flag_cols:
+        combined_expr = F.col(flag_cols[0])
+        for fc in flag_cols[1:]:
+            combined_expr = combined_expr + F.col(fc)
+        
+        result_df = result_df.with_column(
+            'FRAUD_ANY_RULE_FLAG',
+            F.when(combined_expr > 0, F.lit(1)).otherwise(F.lit(0))
+        )
+        
+        result_df = result_df.with_column(
+            'FRAUD_RULES_FIRED_COUNT',
+            combined_expr
+        )
+        
+        print(f"\n  Added column: FRAUD_ANY_RULE_FLAG (OR of all rules)")
+        print(f"  Added column: FRAUD_RULES_FIRED_COUNT (count of rules fired)")
+    
+    # Write to Snowflake table
+    try:
+        result_df.write.mode('overwrite').save_as_table(output_table_name)
+        print(f"\n  ✅ Table created: {output_table_name}")
+    except Exception as e:
+        print(f"\n  ⚠️ Could not save table: {e}")
+        print(f"  Returning DataFrame instead.")
+    
+    return result_df
+
+
+def sensitivity_analysis(sp_df, rule, target_col='FRAUD_TRANS', 
+                         threshold_range_pct=0.20, n_steps=10):
+    """
+    Perform sensitivity analysis on a rule by varying thresholds.
+    Shows how hit rate and fraud capture change with threshold adjustments.
+    
+    Parameters:
+    -----------
+    sp_df : Snowpark DataFrame
+    rule : dict - Rule to analyze
+    target_col : str
+    threshold_range_pct : float - Percentage range to vary thresholds
+    n_steps : int - Number of steps in each direction
+    
+    Returns:
+    --------
+    DataFrame with sensitivity results
+    """
+    
+    print(f"\n{'='*70}")
+    print("SENSITIVITY ANALYSIS")
+    print(f"{'='*70}")
+    print(f"  Base Rule: {rule['rule_string']}")
+    print(f"  Base Hit Rate: {rule['hit_rate']:.2%}")
+    print(f"  Varying thresholds by ±{threshold_range_pct*100:.0f}%")
+    
+    pdf = sp_df.to_pandas()
+    results = []
+    
+    for cond_idx, condition in enumerate(rule['conditions']):
+        col = condition['variable']
+        direction = condition['direction']
+        base_threshold = condition['threshold']
+        
+        print(f"\n  Variable: {col} ({direction} {base_threshold:.4f})")
+        print(f"  {'Threshold':<15} {'Hit Rate':<12} {'Fraud':<10} {'Support':<10}")
+        print(f"  {'-'*47}")
+        
+        # Generate range of thresholds
+        if base_threshold != 0:
+            low = base_threshold * (1 - threshold_range_pct)
+            high = base_threshold * (1 + threshold_range_pct)
+        else:
+            low = base_threshold - 1
+            high = base_threshold + 1
+        
+        thresholds = np.linspace(low, high, n_steps * 2 + 1)
+        
+        for thresh in thresholds:
+            # Apply rule with modified threshold
+            mask = pd.Series([True] * len(pdf), index=pdf.index)
+            
+            for ci, cond in enumerate(rule['conditions']):
+                c_col = cond['variable']
+                c_dir = cond['direction']
+                c_thresh = thresh if ci == cond_idx else cond['threshold']
+                
+                if c_dir == '>':
+                    mask = mask & (pdf[c_col] > c_thresh)
+                else:
+                    mask = mask & (pdf[c_col] < c_thresh)
+            
+            subset = pdf[mask]
+            support = len(subset)
+            fraud_count = subset[target_col].sum() if support > 0 else 0
+            hit_rate = fraud_count / support if support > 0 else 0
+            
+            marker = " <<<" if thresh == base_threshold else ""
+            print(f"  {thresh:<15.4f} {hit_rate:<12.4f} {int(fraud_count):<10} {support:<10}{marker}")
+            
+            results.append({
+                'variable': col,
+                'direction': direction,
+                'threshold': thresh,
+                'is_base': abs(thresh - base_threshold) < 1e-10,
+                'hit_rate': hit_rate,
+                'fraud_captured': int(fraud_count),
+                'support': support
+            })
+    
+    return pd.DataFrame(results)
+
+
+def export_rules_to_sql(rules, target_col='FRAUD_TRANS', table_name='TRANSACTIONS'):
+    """
+    Export rules as SQL CASE statements for direct use in Snowflake.
+    
+    Parameters:
+    -----------
+    rules : list of rule dicts
+    target_col : str
+    table_name : str
+    
+    Returns:
+    --------
+    str : SQL query
+    """
+    
+    print(f"\n{'='*70}")
+    print("SQL EXPORT")
+    print(f"{'='*70}")
+    
+    sql_parts = []
+    sql_parts.append(f"SELECT *,")
+    
+    for i, rule in enumerate(rules[:10], 1):
+        case_conditions = []
+        for condition in rule['conditions']:
+            col = condition['variable']
+            direction = condition['direction']
+            threshold = condition['threshold']
+            case_conditions.append(f"{col} {direction} {threshold}")
+        
+        where_clause = " AND ".join(case_conditions)
+        sql_parts.append(f"  CASE WHEN {where_clause} THEN 1 ELSE 0 END AS FRAUD_RULE_{i},")
+    
+    # Combined flag
+    rule_refs = [f"FRAUD_RULE_{i}" for i in range(1, min(len(rules), 10) + 1)]
+    combined = " + ".join(rule_refs)
+    
+    sql_parts.append(f"  CASE WHEN ({combined}) > 0 THEN 1 ELSE 0 END AS FRAUD_ANY_RULE,")
+    sql_parts.append(f"  ({combined}) AS FRAUD_RULES_FIRED_COUNT")
+    sql_parts.append(f"FROM {table_name};")
+    
+    sql_query = "\n".join(sql_parts)
+    
+    print(sql_query)
+    
+    # Also generate WHERE clause for filtering
+    print(f"\n\n-- Filter query for best rule:")
+    if rules:
+        best_conditions = []
+        for condition in rules[0]['conditions']:
+            col = condition['variable']
+            direction = condition['direction']
+            threshold = condition['threshold']
+            best_conditions.append(f"{col} {direction} {threshold}")
+        
+        where_clause = " AND ".join(best_conditions)
+        print(f"SELECT * FROM {table_name}")
+        print(f"WHERE {where_clause};")
+    
+    return sql_query
+
+
+# =============================================================================
+# USAGE EXAMPLE
+# =============================================================================
+
+"""
+# Example Usage:
+
+# 1. Connect to Snowflake
+from snowflake.snowpark import Session
+
+connection_params = {
+    "account": "your_account",
+    "user": "your_user",
+    "password": "your_password",
+    "warehouse": "your_warehouse",
+    "database": "your_database",
+    "schema": "your_schema"
+}
+
+session = Session.builder.configs(connection_params).create()
+
+# 2. Load your data
+sp_df = session.table("YOUR_TRANSACTION_TABLE")
+
+# 3. Run the full analysis
+results = run_full_analysis(
+    sp_df=sp_df,
+    target_col='FRAUD_TRANS',
+    min_hit_rate=0.10  # 10% minimum hit rate
+)
+
+# 4. Access results
+best_rule = results['best_rule']
+all_rules = results['rules']
+iv_table = results['iv_table']
+
+# 5. Apply best rule to flag transactions
+flagged_df = apply_best_rule_snowpark(sp_df, best_rule)
+flagged_df.show()
+
+# 6. Create a table with all rule flags
+flag_table = create_fraud_flag_table(
+    sp_df=sp_df,
+    rules=results['rules'],
+    output_table_name='FRAUD_FLAGGED_TRANSACTIONS'
+)
+
+# 7. Export rules as SQL
+sql = export_rules_to_sql(results['rules'], table_name='YOUR_TRANSACTION_TABLE')
+
+# 8. Sensitivity analysis on best rule
+sensitivity_df = sensitivity_analysis(sp_df, best_rule)
+
+# 9. Evaluate on Snowpark directly
+eval_results = evaluate_rule_on_snowpark(sp_df, best_rule)
+
+# 10. Generate report
+report = generate_rule_report(results, output_file='fraud_rules_report.txt')
+"""
+
+
+# =============================================================================
+# QUICK START FUNCTION
+# =============================================================================
+
+def quick_start(sp_df, target_col='FRAUD_TRANS', min_hit_rate=0.10):
+    """
+    Quick start function - simplest way to use the fraud rule miner.
+    
+    Parameters:
+    -----------
+    sp_df : Snowpark DataFrame with features and target
+    target_col : str - Binary target (1=fraud, 0=non-fraud)
+    min_hit_rate : float - Minimum precision/hit rate (default 10%)
+    
+    Returns:
+    --------
+    dict with:
+        - best_rule: Best rule found
+        - rules: All qualifying rules
+        - snowpark_filter: Ready-to-use Snowpark filter
+        - sql_where: Ready-to-use SQL WHERE clause
+    """
+    
+    # Run analysis
+    results = run_full_analysis(sp_df, target_col, min_hit_rate)
+    
+    # Prepare easy-to-use outputs
+    output = {
+        'best_rule': results.get('best_rule'),
+        'rules': results.get('rules', []),
+        'iv_table': results.get('iv_table'),
+    }
+    
+    if results.get('best_rule'):
+        br = results['best_rule']
+        
+        # Snowpark filter
+        output['snowpark_filter'] = generate_snowpark_filter(br)
+        
+        # SQL WHERE clause
+        sql_conditions = []
+        for condition in br['conditions']:
+            col = condition['variable']
+            direction = condition['direction']
+            threshold = condition['threshold']
+            sql_conditions.append(f"{col} {direction} {threshold}")
+        
+        output['sql_where'] = " AND ".join(sql_conditions)
+        
+        # Print quick summary
+        print(f"\n{'*' * 70}")
+        print(f"  QUICK RESULTS:")
+        print(f"  Best Rule: {br['rule_string']}")
+        print(f"  Hit Rate:  {br['hit_rate']:.2%}")
+        print(f"  SQL WHERE: {output['sql_where']}")
+        print(f"{'*' * 70}\n")
+    
+    return output
+
+# Simplest usage:
+from snowflake.snowpark import Session
+
+# Connect to Snowflake
+session = Session.builder.configs({
+    "account": "xxx",
+    "user": "xxx",
+    "password": "xxx",
+    "warehouse": "xxx",
+    "database": "xxx",
+    "schema": "xxx"
+}).create()
+
+# Load data
+sp_df = session.table("TRANSACTIONS")
+
+# Run quick analysis
+results = quick_start(sp_df, target_col='FRAUD_TRANS', min_hit_rate=0.10)
+
+# Get best rule
+print(results['best_rule'])
+print(results['sql_where'])
+print(results['snowpark_filter'])
