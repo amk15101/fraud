@@ -1,0 +1,166 @@
+#method 1
+
+
+from snowflake.snowpark import functions as F
+from snowflake.snowpark.window import Window
+import numpy as np
+
+
+def calc_all_iv_fast(sp_df, target_col='FRAUD_TRANS', n_bins=10):
+    """
+    Fastest IV/WOE calculation - one Snowflake query per column,
+    but each query is a single aggregation pushed entirely to Snowflake.
+    Returns: iv_list (sorted desc), woe_dict
+    """
+    numeric_types = {'DecimalType', 'DoubleType', 'FloatType',
+                     'IntegerType', 'LongType', 'ShortType', 'ByteType'}
+    cols = [f.name for f in sp_df.schema.fields
+            if type(f.datatype).__name__ in numeric_types and f.name != target_col]
+
+    # Cache the base table to avoid re-reading source for each column
+    sp_df = sp_df.select([target_col] + cols).cache_result()
+
+    iv_list = []
+    woe_dict = {}
+
+    for c in cols:
+        # Single pushed-down aggregation: bin + group + agg in one shot
+        rows = sp_df.select(
+            F.ntile(n_bins).over(Window.order_by(F.col(c))).alias('B'),
+            F.col(c).alias('V'),
+            F.col(target_col).alias('T')
+        ).group_by('B').agg(
+            F.count('*').alias('N'),
+            F.sum('T').alias('E'),
+            F.min('V').alias('MN'),
+            F.max('V').alias('MX')
+        ).sort('B').collect()
+
+        if not rows:
+            iv_list.append((c, 0.0))
+            woe_dict[c] = []
+            continue
+
+        tot_e = sum(r['E'] or 0 for r in rows)
+        tot_n = sum(r['N'] - (r['E'] or 0) for r in rows)
+        if tot_e == 0 or tot_n == 0:
+            iv_list.append((c, 0.0))
+            woe_dict[c] = []
+            continue
+
+        iv = 0.0
+        woe_rows = []
+        for r in rows:
+            e = r['E'] or 0
+            ne = r['N'] - e
+            pe = max(e / tot_e, 1e-4)
+            pn = max(ne / tot_n, 1e-4)
+            w = np.log(pn / pe)
+            ivc = (pn - pe) * w
+            iv += ivc
+            woe_rows.append({
+                'Bin': r['B'], 'Min': r['MN'], 'Max': r['MX'],
+                'Count': r['N'], 'Events': e, 'Non_Events': ne,
+                'WOE': round(w, 4), 'IV': round(ivc, 6)
+            })
+
+        iv_list.append((c, round(iv, 4)))
+        woe_dict[c] = woe_rows
+        print(f"  {c:<30} IV={round(iv, 4)}")
+
+    iv_list.sort(key=lambda x: x[1], reverse=True)
+    return iv_list, woe_dict
+
+
+# ============================================================
+# USAGE
+# ============================================================
+iv_list, woe_dict = calc_all_iv_fast(sp_df, target_col='FRAUD_TRANS', n_bins=10)
+
+print("\n=== IV RANKING (DESC) ===")
+for var, iv in iv_list:
+    print(f"{var:<30} {iv}")
+
+
+#method2
+from concurrent.futures import ThreadPoolExecutor
+from snowflake.snowpark import functions as F
+from snowflake.snowpark.window import Window
+import numpy as np
+
+
+def calc_all_iv_parallel(sp_df, target_col='FRAUD_TRANS', n_bins=10, workers=16):
+    numeric_types = {'DecimalType', 'DoubleType', 'FloatType',
+                     'IntegerType', 'LongType', 'ShortType', 'ByteType'}
+    cols = [f.name for f in sp_df.schema.fields
+            if type(f.datatype).__name__ in numeric_types and f.name != target_col]
+
+    # ⚡ Cache once - all parallel queries reuse this
+    sp_df = sp_df.select([target_col] + cols).cache_result()
+
+    def process_col(c):
+        rows = sp_df.select(
+            F.ntile(n_bins).over(Window.order_by(F.col(c))).alias('B'),
+            F.col(c).alias('V'),
+            F.col(target_col).alias('T')
+        ).group_by('B').agg(
+            F.count('*').alias('N'),
+            F.sum('T').alias('E'),
+            F.min('V').alias('MN'),
+            F.max('V').alias('MX')
+        ).sort('B').collect()
+
+        if not rows:
+            return c, 0.0, []
+
+        tot_e = sum(r['E'] or 0 for r in rows)
+        tot_n = sum(r['N'] - (r['E'] or 0) for r in rows)
+        if tot_e == 0 or tot_n == 0:
+            return c, 0.0, []
+
+        iv = 0.0
+        woe_rows = []
+        for r in rows:
+            e = r['E'] or 0
+            ne = r['N'] - e
+            pe = max(e / tot_e, 1e-4)
+            pn = max(ne / tot_n, 1e-4)
+            w = np.log(pn / pe)
+            ivc = (pn - pe) * w
+            iv += ivc
+            woe_rows.append({
+                'Bin': r['B'], 'Min': r['MN'], 'Max': r['MX'],
+                'Count': r['N'], 'Events': e, 'Non_Events': ne,
+                'WOE': round(w, 4), 'IV': round(ivc, 6)
+            })
+        return c, round(iv, 4), woe_rows
+
+    print(f"Processing {len(cols)} cols with {workers} parallel workers...")
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        results = list(ex.map(process_col, cols))
+
+    iv_list = sorted([(c, iv) for c, iv, _ in results], key=lambda x: x[1], reverse=True)
+    woe_dict = {c: w for c, _, w in results}
+
+    for c, iv in iv_list:
+        print(f"  {c:<30} IV={iv}")
+
+    return iv_list, woe_dict
+
+
+# ============================================================
+# USAGE
+# ============================================================
+iv_list, woe_dict = calc_all_iv_parallel(sp_df, target_col='FRAUD_TRANS', n_bins=10, workers=16)
+
+print("\n=== IV RANKING (DESC) ===")
+for v, iv in iv_list:
+    print(f"{v:<30} {iv}")
+
+print("\n=== WOE: TRANSACTION_AMT ===")
+for r in woe_dict['TRANSACTION_AMT']:
+    print(r)
+
+print("\n=== WOE: TRANSACTION_AMT ===")
+for r in woe_dict['TRANSACTION_AMT']:
+    print(r)
